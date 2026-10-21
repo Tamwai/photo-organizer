@@ -31,7 +31,23 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller pillow
 
-      - name: Build executable (no compression)
+      - name: Install UPX (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          curl -sL -o upx.zip https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip
+          unzip -q upx.zip
+          echo "UPX_DIR=$(ls -d upx-*/ | head -1)" >> $GITHUB_ENV
+
+      - name: Install UPX (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          curl -sL -o upx.tar.xz https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-amd64_linux.tar.xz
+          tar -xf upx.tar.xz
+          echo "UPX_DIR=$(ls -d upx-*/ | head -1)" >> $GITHUB_ENV
+
+      - name: Build executable
         shell: bash
         run: |
           VERSION=$(python - <<'EOF'
@@ -41,7 +57,11 @@ jobs:
           print(m.group(1))
           EOF
           )
-          pyinstaller --onefile --name "photo-organizer-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
+          if [ -n "$UPX_DIR" ]; then
+            pyinstaller --onefile --upx-dir "$UPX_DIR" --name "photo-organizer-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
+          else
+            pyinstaller --onefile --noupx --name "photo-organizer-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
+          fi
 
       - name: Publish to Release
         uses: softprops/action-gh-release@v2
