@@ -1,0 +1,51 @@
+name: Build Executables
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset_suffix: win64
+          - os: macos-latest
+            asset_suffix: macos
+          - os: ubuntu-latest
+            asset_suffix: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyinstaller pillow
+
+      - name: Build executable (no compression)
+        shell: bash
+        run: |
+          VERSION=$(python - <<'EOF'
+          import re
+          src = open('photo_organizer.py', encoding='utf-8').read()
+          m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', src)
+          print(m.group(1))
+          EOF
+          )
+          pyinstaller --onefile --name "photo-organizer-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
+
+      - name: Publish to Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/*
+          generate_release_notes: false
