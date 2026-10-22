@@ -13,17 +13,28 @@
     python photo_organizer.py --dry-run              # 命令行：模拟整理默认源文件夹
     python photo_organizer.py --gui                  # 强制启动图形界面
     python photo_organizer.py -g                     # 同上
+
+文件分区导航（二审 L1，便于单文件维护）：
+    [1] 常量与基础工具（扩展名/正则/日期解析/传输/收集）     约 28-330 行
+    [2] 整理核心 organize 与日志写入                        约 331-737 行
+    [3] 日志还原与标签着色                                 约 738-880 行
+    [4] i18n 字符串表（zh/en）                             约 881-1590 行
+    [5] 配置读写与通用工具（_run_bg/_ToolTip/format_log_*）  约 1591-2050 行
+    [6] GUI PhotoOrganizerApp                             约 2051-2790 行
+    [7] CLI main() 与入口                                  约 2791-3024 行
 """
 import sys
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 import os
 import re
 import shutil
 import json
+import unicodedata
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 try:
     from PIL import Image
@@ -65,7 +76,12 @@ def get_config_dir() -> Path:
         base = Path.home() / "Library/Application Support"
     else:
         base = Path(os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config")))
-    d = base / APP_NAME
+    return base / APP_NAME
+
+
+def ensure_config_dir() -> Path:
+    """确保配置目录存在（写入类操作前调用；读取类操作不创建目录，避免 import 副作用）。"""
+    d = get_config_dir()
     try:
         d.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -90,8 +106,9 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> bool:
-    """保存配置到平台规范目录。"""
+    """保存配置到平台规范目录（写入前确保目录存在）。"""
     try:
+        ensure_config_dir()
         with open(get_config_file(), "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         return True
@@ -152,7 +169,7 @@ def clear_all_data() -> dict:
 #   2026.08.06.jpg / 2026 08 06.jpg / 20260806.jpg / VID_2026-08-06.mp4
 # 分隔符：- _ . 空格（可混用），也可无分隔符（8 位连续数字）
 NAME_DATE_PATTERNS = [
-    re.compile(r"(\d{4})\s*[-_.]?\s*(\d{2})\s*[-_.]?\s*(\d{2})"),
+    re.compile(r"(?<!\d)(\d{4})\s*[-_.]?\s*(\d{2})\s*[-_.]?\s*(\d{2})(?!\d)"),
 ]
 # Unix 时间戳模式：13 位毫秒（mmexport1785419041663 等） / 10 位秒（1785419041 等）
 TS_PATTERNS = [
@@ -162,6 +179,19 @@ TS_PATTERNS = [
 # 合理年份范围（照片/视频拍摄时间不会超出）
 MIN_YEAR, MAX_YEAR = 1970, 2099
 # ============================
+# 布局与数量常量（二审 STYLE1：消除魔法数字）
+FMT_DIALOG_GEOM = "440x400"
+FMT_DIALOG_MINSIZE = (400, 340)
+FMT_HELP_GEOM = "460x420"
+FMT_HELP_MINSIZE = (420, 360)
+HELP_GEOM = "560x500"
+HELP_MINSIZE = (480, 380)
+DEFAULT_LOG_KEEP = 30
+MAX_HISTORY = 10
+FMT_GRID_COLS = 3  # 格式弹窗扩展名网格列数
+# 文件名防御：控制字符（二审 SEC3）
+_CTRL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# ============================
 
 
 def get_exif_dt(filepath: str) -> datetime | None:
@@ -169,23 +199,23 @@ def get_exif_dt(filepath: str) -> datetime | None:
     if not HAS_PIL:
         return None
     try:
-        img = Image.open(filepath)
-        exif = img.getexif()
-        if exif:
-            # 顶层 IFD0
-            for tag_id, value in exif.items():
-                tag_name = TAGS.get(tag_id, "")
-                if tag_name == "DateTimeOriginal":
-                    return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-            # Exif 子 IFD（0x8769），DateTimeOriginal 通常存放在这里
-            try:
-                sub = exif.get_ifd(0x8769)
-            except Exception:
-                sub = {}
-            for tag_id, value in sub.items():
-                tag_name = TAGS.get(tag_id, "")
-                if tag_name == "DateTimeOriginal":
-                    return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+        with Image.open(filepath) as img:
+            exif = img.getexif()
+            if exif:
+                # 顶层 IFD0
+                for tag_id, value in exif.items():
+                    tag_name = TAGS.get(tag_id, "")
+                    if tag_name == "DateTimeOriginal":
+                        return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                # Exif 子 IFD（0x8769），DateTimeOriginal 通常存放在这里
+                try:
+                    sub = exif.get_ifd(0x8769)
+                except Exception:
+                    sub = {}
+                for tag_id, value in sub.items():
+                    tag_name = TAGS.get(tag_id, "")
+                    if tag_name == "DateTimeOriginal":
+                        return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
     except Exception:
         pass
     return None
@@ -219,8 +249,12 @@ def get_name_dt(filename: str) -> datetime | None:
                 ts = int(m.group(1))
                 if ts >= 10**12:  # 13 位毫秒
                     ts //= 1000
+                elif not filename.startswith(("mmexport", "wx_camera_")):
+                    # 10 位秒级时间戳：仅接受已知拍摄应用前缀，避免普通数字串误判（二审 S2）
+                    continue
                 dt = datetime.fromtimestamp(ts)
-                if MIN_YEAR <= dt.year <= MAX_YEAR:
+                # 合理性收紧：仅接受 2000-01-01 至当前时间之间（二审 S2：避免把普通数字串误判为拍摄时间）
+                if datetime(2000, 1, 1) <= dt <= datetime.now():
                     return dt
             except (ValueError, OSError, OverflowError):
                 continue
@@ -234,22 +268,71 @@ def get_name_date(filename: str, date_fmt: str = DATE_FMT) -> str | None:
 
 
 def get_file_dt(filepath: str) -> datetime | None:
-    """获取文件日期对象：优先 EXIF，其次文件名日期，最后取修改时间和创建时间中较早的"""
+    """获取文件日期对象：优先 EXIF，其次文件名日期，最后取文件时间。"""
     dt = get_exif_dt(filepath)
     if dt:
         return dt
+    return get_file_dt_noexif(filepath)
+
+
+def get_file_dt_noexif(filepath: str) -> datetime | None:
+    """跳过 EXIF 的文件日期：文件名日期优先，其次文件时间（二审 PERF1 供 --no-exif 使用）。
+
+    平台差异：Windows 取「修改时间」与「创建时间（st_ctime 近似）」中较早者；
+    Linux/macOS 的 st_ctime 为元数据变更时间而非创建时间，仅取修改时间 st_mtime。
+    """
     dt = get_name_dt(Path(filepath).name)
     if dt:
         return dt
     stat = os.stat(filepath)
-    earliest = min(stat.st_mtime, stat.st_ctime)
+    if os.name == "nt":
+        earliest = min(stat.st_mtime, stat.st_ctime)
+    else:
+        earliest = stat.st_mtime
     return datetime.fromtimestamp(earliest)
 
 
 def get_file_date(filepath: str, date_fmt: str = DATE_FMT) -> str:
-    """获取文件日期（字符串格式）：优先 EXIF，其次文件名日期，最后取修改时间和创建时间中较早的"""
+    """获取文件日期（字符串格式）：优先 EXIF，其次文件名日期，最后取文件时间（Windows 含创建时间）"""
     dt = get_file_dt(filepath)
     return dt.strftime(date_fmt) if dt else ""
+
+
+def _sanitize_name(name: str) -> str:
+    """过滤文件名中的控制字符（防御性清洗，正常文件名不含；二审 SEC3）。"""
+    return _CTRL_CHARS.sub("_", name)
+
+
+def _clamp_log_keep(raw) -> int:
+    """安全解析操作清单保留份数（非法/越界回退默认值；二审 M1 用于主线程快照）。"""
+    try:
+        n = int(str(raw).strip() or DEFAULT_LOG_KEEP)
+    except (TypeError, ValueError):
+        n = DEFAULT_LOG_KEEP
+    return max(1, min(n, 999))
+
+
+def _is_trashed_file(name: str) -> bool:
+    """.trashed 为 Android 回收站文件（文件名以 .trashed- 开头），优先于隐藏判定。"""
+    return name.lower().startswith(".trashed-")
+
+
+def _is_hidden_file(path: Path) -> bool:
+    """跨平台隐藏判定：Unix 点开头文件名，或 Windows 隐藏属性（FILE_ATTRIBUTE_HIDDEN）。"""
+    if path.name.startswith("."):
+        return True
+    if os.name == "nt":
+        try:
+            return bool(getattr(path.stat(), "st_file_attributes", 0) & 0x2)
+        except OSError:
+            return False
+    return False
+
+
+def _tag_pad(text: str, width: int = 12) -> str:
+    """标签列定宽补空格：按显示宽度对齐（中文 2 列、英文 1 列），使文件名统一列开始。"""
+    disp = sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+    return text + " " * max(0, width - disp)
 
 
 def collect_files(source: Path, dest_root: Path, supported: set, recursive: bool):
@@ -258,50 +341,58 @@ def collect_files(source: Path, dest_root: Path, supported: set, recursive: bool
     - 返回文件路径列表（递归时保留相对路径用于日志）
     """
     if not recursive:
-        return [f for f in source.iterdir() if f.is_file() and f.suffix.lower() in supported]
+        return [f for f in source.iterdir()
+                if f.is_file() and not f.is_symlink() and f.suffix.lower() in supported]
     files = []
     dest_resolved = dest_root.resolve()
     for root, dirs, names in os.walk(source):
         root_path = Path(root)
-        # 目标文件夹在源目录内时，剪掉该分支，避免把已归类文件当源文件
+        # 目标文件夹在源目录内时，剪掉该分支（其下所有子目录一并排除），避免把已归类文件当源文件
         dirs[:] = [d for d in dirs if (root_path / d).resolve() != dest_resolved]
         for name in names:
             p = root_path / name
-            if p.is_file() and p.suffix.lower() in supported:
+            if p.is_file() and not p.is_symlink() and p.suffix.lower() in supported:
                 files.append(p)
     return files
 
 
 def _safe_transfer(src: Path, dest: Path, copy_mode: bool) -> None:
-    """原子传输：先写 .po-tmp 临时文件，完成后 os.replace 原子改名。
-    - 复制模式：copy2 到 dest.po-tmp → replace
+    """原子传输：先写 .photo-org-tmp 临时文件，完成后 os.replace 原子改名。
+    - 复制模式：copy2 到 dest.photo-org-tmp → replace
     - 移动模式同盘：shutil.move（os.rename 本身原子）
-    - 移动模式跨盘：copy2 到 dest.po-tmp → replace → 删源
-    失败时清理本次 .po-tmp 残留，不留半成品。
+    - 移动模式跨盘：copy2 到 dest.photo-org-tmp → replace → 删源
+    失败时清理本次 .photo-org-tmp 残留，不留半成品。
     """
-    tmp = dest.with_name(dest.name + ".po-tmp")
+    tmp = None
     try:
         if copy_mode:
+            tmp = dest.with_name(dest.name + ".photo-org-tmp")
             shutil.copy2(str(src), str(tmp))
             os.replace(tmp, dest)
         else:
             if os.stat(src).st_dev == os.stat(dest.parent).st_dev:
                 shutil.move(str(src), str(dest))
             else:
+                tmp = dest.with_name(dest.name + ".photo-org-tmp")
                 shutil.copy2(str(src), str(tmp))
                 os.replace(tmp, dest)
-                src.unlink()
+                # 跨盘移动：目标副本已原子就位，源删除失败时抛出明确错误（目标文件仍完整可用）
+                try:
+                    src.unlink()
+                except OSError as e:
+                    raise OSError(f"{_t('err_move_src_rm')}{src} ({e})") from e
     except Exception:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
         raise
 
 
 def _cleanup_parts(dest_root: Path) -> list:
-    """扫描目标目录下残留的 .po-tmp 半成品文件（本脚本专属后缀），返回文件列表（不删除）。
+    """扫描目标目录下残留的 .photo-org-tmp 半成品文件（本脚本专属后缀），返回文件列表（不删除）。
 
     盘根保护：目标目录是文件系统根（如 D:/）时不做全盘递归扫描，直接返回空列表，
     避免 rglob 全盘遍历造成长时间卡顿。
@@ -311,25 +402,9 @@ def _cleanup_parts(dest_root: Path) -> list:
     if dest_root.resolve() == Path(dest_root.anchor).resolve():
         return []
     try:
-        return [p for p in dest_root.rglob("*.po-tmp")]
+        return [p for p in dest_root.rglob("*.photo-org-tmp")]
     except OSError:
         return []
-
-
-def _remove_parts(dest_root: Path) -> list:
-    """删除目标目录下残留的 .po-tmp 半成品文件，返回实际删除的文件列表。
-
-    盘根保护：目标目录是文件系统根（如 D:/）时不执行全盘递归删除，直接返回空列表。
-    """
-    parts = _cleanup_parts(dest_root)
-    removed = []
-    for p in parts:
-        try:
-            p.unlink()
-            removed.append(p)
-        except OSError:
-            pass
-    return removed
 
 
 def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
@@ -343,6 +418,8 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
              photo_exts: set | None = None,
              add_photo_exts: set | list | None = None,
              remove_photo_exts: set | list | None = None,
+             no_exif: bool = False,
+             include_hidden_trash: bool = False,
              actions: list | None = None):
     """整理源文件夹中的照片/视频到目标文件夹的日期子文件夹。
     - source_dir: 源文件夹（从中读取照片）
@@ -361,6 +438,8 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
     - photo_exts: 图片格式集合（默认基础 9 种 BASE_PHOTO_EXTS；GUI 传入本次运行勾选结果）
     - add_photo_exts: 额外增加的图片扩展名（CLI --add-photo-ext）
     - remove_photo_exts: 临时排除的图片扩展名（CLI --remove-photo-ext）
+    - no_exif: True 时跳过 EXIF 读取（文件名日期优先，其次文件时间），大量文件时更快（二审 PERF1）
+    - include_hidden_trash: True 时也整理隐藏文件与 .trashed 文件（默认 False：跳过并打 [跳过][隐藏]/[跳过][Trash] 标签统计）
     - actions: 可选列表；非模拟运行时，每次移动/复制成功追加
       {"type": "move"/"copy", "src": 原路径, "dst": 目标路径, "ok": True}，供保存操作清单与还原使用
     """
@@ -374,6 +453,14 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
         log_func(f"{_t('err_src_not_dir')}{source_dir}")
         return
     dest_root = Path(dest_dir)
+    if dest_root.resolve() != Path(dest_root.anchor).resolve() and not dest_root.exists():
+        # 目标文件夹不存在时自动创建（盘根如 D:/ 除外，避免误建/不可操作）
+        try:
+            dest_root.mkdir(parents=True, exist_ok=True)
+            log_func(f"{_t('log_dest_created')}{dest_root}")
+        except OSError as e:
+            log_func(f"{_t('err_dest_create')}{dest_root} ({e})")
+            return
     if not dest_root.exists():
         log_func(f"{_t('err_dest_missing')}{dest_dir}")
         return
@@ -394,6 +481,25 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
         log_func(f"{_t('err_bad_fmt')}{e}")
         return
 
+    # 层级分组模式白名单：仅接受 单层(None)/Y/YM/YMD（二审 M4）
+    if group_levels not in (None, "Y", "YM", "YMD"):
+        log_func(f"{_t('err_bad_group')}{group_levels}")
+        return
+
+    # 拒绝日期格式中混入时间指令（避免生成带时分秒的文件夹名，二审 M4）
+    _TIME_DIRECTIVES = ("%H", "%I", "%M", "%S", "%f", "%p", "%X", "%c")
+    for _label, _fmt in (("date_fmt", date_fmt),
+                         ("year_fmt", year_fmt),
+                         ("month_fmt", month_fmt),
+                         ("day_fmt", day_fmt)):
+        for _d in _TIME_DIRECTIVES:
+            if _d in _fmt:
+                log_func(f"{_t('err_fmt_time')}{_label} ({_fmt})")
+                return
+    if date_folder_in_group and not group_levels:
+        # 无分组层级时「分组时创建日期文件夹」无实际效果：提示并忽略（不改行为）
+        log_func(_t("warn_group_need"))
+
     # 图片格式：默认基础 9 种，可叠加 CLI 加减
     exts = set(photo_exts) if photo_exts else set(BASE_PHOTO_EXTS)
     exts |= {str(e).strip().lower() for e in (add_photo_exts or []) if str(e).strip()}
@@ -413,7 +519,7 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
         return
 
     stats = {"moved": 0, "copied": 0, "skipped": 0, "failed": 0, "new_dirs": set(), "exif": 0, "fallback": 0,
-             "skip_dup": 0, "skip_nodate": 0, "skip_in_place": 0, "by_ext": {}}
+             "skip_dup": 0, "skip_nodate": 0, "skip_in_place": 0, "hidden": 0, "trash": 0, "by_ext": {}}
     seen_names: dict[str, set] = {}  # date_str -> 已占用文件名集合（dry-run 也能量重名）
 
     # 跳过已有日期文件夹：仅原地整理（源=目标）时生效。
@@ -421,20 +527,23 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
     classified_dirs: set[Path] = set()
     if skip_existing_date_folders:
         if not recursive:
-            log_func(_t("info_skip_need_recursive"))
+            log_func(_t("tag_tip") + _t("info_skip_need_recursive"))
         elif source.resolve() != dest_root.resolve():
-            log_func(_t("info_skip_need_inplace"))
+            log_func(_t("tag_tip") + _t("info_skip_need_inplace"))
         else:
             try:
                 if group_levels:
                     # 层级分组：逐层匹配 年/月/日（date_folder_in_group 时最内层再套 date_fmt）
                     def _match_level(parent: Path, fmt: str) -> list[Path]:
+                        # 严格匹配：strptime 解析成功后须 strftime 回比一致，
+                        # 避免宽松格式（如 %Y）把任意 4 位数字目录误判为日期目录
                         matched = []
                         for d in parent.iterdir():
                             if d.is_dir():
                                 try:
-                                    datetime.strptime(d.name, fmt)
-                                    matched.append(d)
+                                    dt = datetime.strptime(d.name, fmt)
+                                    if dt.strftime(fmt) == d.name:
+                                        matched.append(d)
                                 except ValueError:
                                     pass
                         return matched
@@ -478,24 +587,54 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
             if p.parent in classified_dirs:
                 stats["skipped"] += 1
                 stats["skip_in_place"] += 1
-                log_func(f"{_t('skip_in_place')}{p.name}{_t('skip_in_place_post')}")
+                log_func(f"{_tag_pad(_t('tag_skip'))}{p.name}{_t('skip_in_place_post')}")
                 continue
+            # 隐藏/.trashed 文件：默认不处理并打 [跳过][隐藏]/[跳过][Trash] 标签；
+            # 勾选后正常归类。隐藏与 Trash 判定互不短路（可同时命中），视频额外补 [视频] 标签
+            is_trash = _is_trashed_file(p.name)
+            is_hidden = _is_hidden_file(p)
+            is_video = p.suffix.lower() in VIDEO_EXTS
+            if is_trash or is_hidden:
+                if not include_hidden_trash:
+                    stats["skipped"] += 1
+                    if is_trash:
+                        stats["trash"] += 1
+                    else:
+                        stats["hidden"] += 1
+                    skip_tags = ((_t("tag_hidden") if is_hidden else "")
+                                 + (_t("tag_trash") if is_trash else "")
+                                 + (_t("tag_video") if is_video else ""))
+                    log_func(f"{_tag_pad(_t('tag_skip') + skip_tags)}{p.name}")
+                    continue
+                if is_trash:
+                    stats["trash"] += 1
+                else:
+                    stats["hidden"] += 1
+            extra_tag = ((_t("tag_hidden") if is_hidden else "")
+                         + (_t("tag_trash") if is_trash else "")
+                         + (_t("tag_video") if is_video else ""))
             ext = p.suffix.lower()
             ext_stat = stats["by_ext"].setdefault(ext, {"total": 0, "exif": 0, "fallback": 0})
             ext_stat["total"] += 1
-            dt = get_exif_dt(str(p))
-            if dt:
-                stats["exif"] += 1
-                ext_stat["exif"] += 1
-            else:
-                dt = get_file_dt(str(p))
+            if no_exif:
+                # --no-exif：跳过 EXIF 读取，文件名日期优先，其次文件时间（二审 PERF1）
+                dt = get_file_dt_noexif(str(p))
                 stats["fallback"] += 1
                 ext_stat["fallback"] += 1
+            else:
+                dt = get_exif_dt(str(p))
+                if dt:
+                    stats["exif"] += 1
+                    ext_stat["exif"] += 1
+                else:
+                    dt = get_file_dt(str(p))
+                    stats["fallback"] += 1
+                    ext_stat["fallback"] += 1
 
             if dt is None:
                 stats["skipped"] += 1
                 stats["skip_nodate"] += 1
-                log_func(f"{_t('skip_no_date')}{p.name}")
+                log_func(f"{_tag_pad(_t('tag_skip'))}{p.name}{_t('skip_no_date_post')}")
                 continue
 
             # 目标相对路径：单层格式 or 年/月/日层级嵌套（分组时可再叠一层日期文件夹）
@@ -530,36 +669,37 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
                 if not prefix_duplicates:
                     stats["skipped"] += 1
                     stats["skip_dup"] += 1
-                    log_func(f"{_t('skip_exists')}{rel} -> {date_str}/")
+                    log_func(f"{_tag_pad(_t('tag_skip'))}{rel}{_t('skip_exists_post')} -> {date_str}/")
                 else:
                     # 自动加来源文件夹名前缀（顶层文件即源目录名），仍冲突则追加序号
                     prefix = p.parent.name
                     base, ext = os.path.splitext(p.name)
-                    new_name = f"{prefix}_{p.name}"
+                    # 防御：剔除路径中不可见的控制字符（正常文件名不含，防御异常输入；二审 SEC3）
+                    new_name = _sanitize_name(f"{prefix}_{p.name}")
                     dest_path = dest_dir_path / new_name
                     counter = 1
                     while dest_path.exists() or new_name in occupied:
-                        new_name = f"{prefix}_{base}_{counter}{ext}"
+                        new_name = _sanitize_name(f"{prefix}_{base}_{counter}{ext}")
                         dest_path = dest_dir_path / new_name
                         counter += 1
                     occupied.add(new_name)
                     if dry_run:
                         stats["copied" if copy_mode else "moved"] += 1
-                        log_func(f"{_t('tag_sim')}{_t('tag_rename')} {rel} -> {date_str}/{new_name}")
+                        log_func(f"{_tag_pad(_t('tag_sim') + _t('tag_rename') + extra_tag)}{rel} -> {date_str}/{new_name}")
                         if actions is not None:
                             actions.append({"type": "plan_copy" if copy_mode else "plan_move",
                                             "src": str(p), "dst": str(dest_path), "ok": True})
                     else:
                         _safe_transfer(p, dest_path, copy_mode)
                         stats["copied" if copy_mode else "moved"] += 1
-                        log_func(f"{_t('tag_rename')} {rel} -> {date_str}/{new_name}")
+                        log_func(f"{_tag_pad(_t('tag_rename') + extra_tag)}{rel} -> {date_str}/{new_name}")
                         if actions is not None:
                             actions.append({"type": "copy" if copy_mode else "move",
                                             "src": str(p), "dst": str(dest_path), "ok": True})
             elif dry_run:
                 stats["copied" if copy_mode else "moved"] += 1
                 occupied.add(p.name)
-                log_func(f"{_t('tag_sim')}{_t('tag_copy') if copy_mode else _t('tag_move')} {rel} -> {date_str}/")
+                log_func(f"{_tag_pad(_t('tag_sim') + (_t('tag_copy') if copy_mode else _t('tag_move')) + extra_tag)}{rel} -> {date_str}/")
                 if actions is not None:
                     actions.append({"type": "plan_copy" if copy_mode else "plan_move",
                                     "src": str(p), "dst": str(dest_path), "ok": True})
@@ -567,18 +707,20 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
                 _safe_transfer(p, dest_path, copy_mode)
                 stats["copied" if copy_mode else "moved"] += 1
                 occupied.add(p.name)
-                log_func(f"{_t('tag_copy') if copy_mode else _t('tag_move')} {rel} -> {date_str}/")
+                log_func(f"{_tag_pad((_t('tag_copy') if copy_mode else _t('tag_move')) + extra_tag)}{rel} -> {date_str}/")
                 if actions is not None:
                     actions.append({"type": "copy" if copy_mode else "move",
                                     "src": str(p), "dst": str(dest_path), "ok": True})
         except Exception as e:
             stats["failed"] += 1
-            log_func(f"{_t('err_failed')}{p.name} ({e})")
+            log_func(f"{_tag_pad(_t('tag_error'))}{p.name} ({e})")
 
     mode = _t("mode_dry") if dry_run else (_t("mode_copy_done") if copy_mode else _t("mode_org_done"))
     log_func(f"\n===== {mode} =====")
     log_func(f"{_t('sum_move')}{stats['moved']}{_t('sum_copied_sep')}{stats['copied']}{_t('sum_skipped_sep')}{stats['skipped']}{_t('sum_failed_sep')}{stats['failed']}{_t('unit_zhang')}")
     log_func(f"{_t('sum_new_dirs')}{len(stats['new_dirs'])}{_t('unit_ge')}")
+    if stats["hidden"] or stats["trash"]:
+        log_func(f"{_t('sum_hidden_pre')}{stats['hidden']}{_t('sum_trash_sep')}{stats['trash']}{_t('unit_ge')}")
     log_func(f"{_t('sum_exif')}{stats['exif']}{_t('sum_fallback_sep')}{stats['fallback']}{_t('unit_zhang')}")
 
     # 图片/视频大类统计
@@ -598,8 +740,8 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
     for ext, c in sorted(stats["by_ext"].items()):
         log_func(f"  {ext}: {c['total']}{_t('detail_exif_sep')}{c['exif']}{_t('detail_fallback_sep')}{c['fallback']})")
     # 跳过原因细分
-    if stats["skip_in_place"] or stats["skip_dup"] or stats["skip_nodate"]:
-        log_func(f"{_t('detail_skip_pre')}{stats['skip_in_place']}{_t('detail_skip_dup_sep')}{stats['skip_dup']}{_t('detail_skip_nodate_sep')}{stats['skip_nodate']}{_t('unit_zhang')}")
+    if stats["skip_in_place"] or stats["skip_dup"] or stats["skip_nodate"] or stats["hidden"] or stats["trash"]:
+        log_func(f"{_t('detail_skip_pre')}{stats['skip_in_place']}{_t('detail_skip_dup_sep')}{stats['skip_dup']}{_t('detail_skip_nodate_sep')}{stats['skip_nodate']}{_t('detail_skip_hidden_sep')}{stats['hidden']}{_t('detail_skip_trash_sep')}{stats['trash']}{_t('unit_zhang')}")
     return stats
 
 
@@ -643,13 +785,13 @@ def write_organize_log(meta: dict, lines: list, actions: list, keep: int) -> Pat
     stem = jsonl_path.stem
     try:
         with open(jsonl_path, "w", encoding="utf-8") as f:
-            meta_rec = {"type": "meta", "ok": False, **meta}
+            meta_rec = {"type": "meta", "ok": False, "action_count": len(actions), **meta}
             f.write(json.dumps(meta_rec, ensure_ascii=False) + "\n")
             for rec in actions:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError as e:
-        jsonl_path = Path(str(jsonl_path) + "_ioerr.jsonl")  # 兜底避免覆盖
-        return jsonl_path
+        # 写入失败不返回假路径：抛出原始异常，由上层统一报错，避免用户误以为清单已保存
+        raise OSError(f"{_t('err_save_log')}{e}") from e
     # 清理旧操作清单：保留最近 keep 份
     try:
         keep = max(1, int(keep))
@@ -660,6 +802,26 @@ def write_organize_log(meta: dict, lines: list, actions: list, keep: int) -> Pat
     except OSError:
         pass
     return jsonl_path
+
+
+def _path_within(root: Path, p: Path) -> bool:
+    """路径范围校验（二审 SEC1）：p 必须位于 root 目录之下。
+
+    拒绝条件：路径含 '..' 段、解析失败、或解析结果为文件系统根。
+    """
+    try:
+        r = root.resolve()
+        q = p.resolve()
+    except OSError:
+        return False
+    if ".." in p.parts or ".." in q.parts:
+        return False
+    if q == q.anchor:  # 文件系统根
+        return False
+    try:
+        return q.is_relative_to(r)
+    except AttributeError:
+        return str(q).startswith(str(r) + os.sep)
 
 
 def restore_from_log(stem: str, log_func=print) -> dict:
@@ -677,6 +839,19 @@ def restore_from_log(stem: str, log_func=print) -> dict:
     stats = {"moved": 0, "removed": 0, "skipped": 0, "missing": 0}
     try:
         with open(jsonl_path, "r", encoding="utf-8") as f:
+            # 首行为会话元信息：记录源/目标目录，作为还原路径范围校验基准（二审 SEC1）
+            src_root = dest_root = None
+            first = f.readline().strip()
+            if first:
+                try:
+                    meta_rec = json.loads(first)
+                except json.JSONDecodeError:
+                    meta_rec = {}
+                if meta_rec.get("type") == "meta":
+                    src_root = Path(meta_rec["src"]) if meta_rec.get("src") else None
+                    dest_root = Path(meta_rec["dest"]) if meta_rec.get("dest") else None
+            if src_root is None or dest_root is None:
+                return {"error": _t("err_restore_scope")}
             for line in f:
                 line = line.strip()
                 if not line:
@@ -690,6 +865,11 @@ def restore_from_log(stem: str, log_func=print) -> dict:
                 typ = rec.get("type")
                 src = Path(rec["src"])
                 dst = Path(rec["dst"])
+                # 二审 SEC1：路径必须位于该次会话记录的源/目标目录之下，否则跳过并告警
+                if not (_path_within(src_root, src) and _path_within(dest_root, dst)):
+                    stats["skipped"] += 1
+                    log_func(f"{_t('warn_restore_skip_scope')}{src} -> {dst}")
+                    continue
                 if typ == "move":
                     if not dst.exists():
                         stats["missing"] += 1
@@ -701,10 +881,10 @@ def restore_from_log(stem: str, log_func=print) -> dict:
                         continue
                     try:
                         src.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(dst), str(src))
+                        _safe_transfer(dst, src, copy_mode=False)
                         stats["moved"] += 1
                         log_func(f"{_t('restore_move_pre')}{dst} -> {src}")
-                    except OSError as e:
+                    except Exception as e:
                         stats["skipped"] += 1
                         log_func(f"{_t('err_restore')}{dst} -> {src} ({e})")
                 elif typ == "copy":
@@ -724,8 +904,17 @@ def restore_from_log(stem: str, log_func=print) -> dict:
     return stats
 
 
+def _rollback_done_msg(stats: dict) -> str:
+    """还原完成汇总行（i18n 拼接，避免硬编码中文）。"""
+    return (f"{_t('rollback_done_pre')}{stats.get('moved', 0)}{_t('rollback_done_rm_sep')}{stats.get('removed', 0)}"
+            f"{_t('rollback_done_skip_sep')}{stats.get('skipped', 0)}{_t('rollback_done_missing_sep')}{stats.get('missing', 0)}")
+
+
 # ========== 日志标签着色（GUI 与 CLI 共用） ==========
-def _match_log_tag(msg: str) -> str | None:
+_LOG_TAG = Literal["err", "warn", "skip", "sim", "move", "copy", "rename", "info", "hidden", "trash", "video"]
+
+
+def _match_log_tag(msg: str) -> _LOG_TAG | None:
     """按消息前缀匹配动作标签类别，返回着色标签名（供 GUI ScrolledText 与 CLI ANSI 共用）。
 
     匹配顺序：错误/删除红 → 警告橙 → 跳过黄 → 模拟青 → 移动绿 → 复制蓝 → 重命名紫 → 信息蓝。
@@ -744,8 +933,14 @@ def _match_log_tag(msg: str) -> str | None:
         return "copy"
     if msg.startswith(_t("tag_rename")):
         return "rename"
-    if msg.startswith(_t("tag_info")) or msg.startswith("[提示]"):
+    if msg.startswith(_t("tag_info")):
         return "info"
+    if msg.startswith(_t("tag_hidden")):
+        return "hidden"
+    if msg.startswith(_t("tag_trash")):
+        return "trash"
+    if msg.startswith(_t("tag_video")):
+        return "video"
     return None
 
 
@@ -765,13 +960,24 @@ def _log_label_pairs() -> list:
         (_t("tag_copy"), "copy"),
         (_t("tag_rename"), "rename"),
         (_t("tag_info"), "info"),
+        (_t("tag_tip"), "info"),
+        (_t("tag_hidden"), "hidden"),
+        (_t("tag_trash"), "trash"),
+        (_t("tag_video"), "video"),
         (_t("sum_move"), "move"),
         (_t("sum_copied_sep").split("|")[-1].strip() + " ", "copy"),
         (_t("sum_skipped_sep").split("|")[-1].strip() + " ", "skip"),
         (_t("sum_failed_sep").split("|")[-1].strip() + " ", "err"),
         (_t("sum_new_dirs"), "dir"),
+        (_t("sum_hidden_pre"), "hidden"),
+        (_t("sum_trash_sep").split("|")[-1].strip() + " ", "trash"),
         (_t("sum_exif"), "exif"),
         (_t("sum_fallback_sep").split("|")[-1].strip() + " ", "fallback"),
+        # 处理明细/按文件类型：标题行着色 + 明细行 EXIF/兜底 词着色（中英双语一致）
+        (_t("detail_title").strip(), "info"),
+        (_t("detail_by_ext").strip(), "info"),
+        ("EXIF", "exif"),
+        (_t("detail_fallback_sep").strip(" |"), "fallback"),
     ]
     return [(a, b) for a, b in pairs if a]
 
@@ -784,6 +990,8 @@ def _stats_to_meta(stats: dict) -> dict:
         "skipped": int(stats.get("skipped", 0)),
         "failed": int(stats.get("failed", 0)),
         "new_dirs": len(stats.get("new_dirs") or ()),
+        "hidden": int(stats.get("hidden", 0)),
+        "trash": int(stats.get("trash", 0)),
         "exif": int(stats.get("exif", 0)),
         "fallback": int(stats.get("fallback", 0)),
         "by_ext": stats.get("by_ext") or {},
@@ -801,6 +1009,9 @@ def format_log_summary(rec: dict) -> str:
         f"{_t('tag_info')} {_t('sum_new_dirs')}{s.get('new_dirs', 0)}{_t('unit_ge')}",
         f"{_t('tag_info')} {_t('sum_exif')}{s.get('exif', 0)}{_t('sum_fallback_sep')}{s.get('fallback', 0)}{_t('unit_zhang')}",
     ]
+    if s.get("hidden") or s.get("trash"):
+        out.append(f"{_t('tag_info')} {_t('sum_hidden_pre')}{s.get('hidden', 0)}"
+                   f"{_t('sum_trash_sep')}{s.get('trash', 0)}{_t('unit_zhang')}")
     by_ext = s.get("by_ext")
     if isinstance(by_ext, dict) and by_ext:
         out.append(_t("detail_by_ext"))
@@ -854,8 +1065,18 @@ def format_log_line(rec: dict) -> str:
 # ========== 图形界面（--gui / -g 启动） ==========
 import queue
 import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+
+def _group_key_to_label(key: str) -> str:
+    """内部分组代号 → 界面文案（兼容旧配置直接存文案的情况）。"""
+    labels = {"flat": _t("group_flat"), "Y": _t("group_year"), "YM": _t("group_ym"), "YMD": _t("group_ymd")}
+    return labels.get(key, key)
+
+
+def _group_label_to_key(label: str) -> str:
+    """界面文案 → 内部分组代号（未知值回退单层）。"""
+    keys = {_t("group_flat"): "flat", _t("group_year"): "Y", _t("group_ym"): "YM", _t("group_ymd"): "YMD"}
+    return keys.get(label, "flat")
 # ============ 国际化（中英双语，跟随系统语言） ============
 STRINGS = {
     "zh":     {
@@ -863,16 +1084,12 @@ STRINGS = {
         "lbl_src": "源文件夹:",
         "lbl_dest": "目标文件夹:",
         "btn_browse": "浏览...",
-        "btn_clear_paths": "清除路径记录",
-        "tip_clear_paths": "清除配置中记住的源/目标文件夹历史（只删记录，不删除任何真实文件夹）",
-        "msg_clear_paths_confirm": "将清除配置中记住的源文件夹与目标文件夹历史记录。\n此操作只删除记忆，不会删除任何真实文件夹或文件。\n\n确定清除？",
-        "log_paths_cleared": "[路径] 已清除源/目标文件夹历史记录",
         "chk_video": "同时整理视频",
         "chk_copy_mode": "复制模式",
         "chk_prefix": "重名自动加前缀",
         "chk_recursive": "包含子文件夹",
-        "chk_cleanup_parts": "启动时清理半成品",
         "chk_skip_existing": "跳过已有日期文件夹",
+        "chk_hidden_trash": "包含隐藏文件和.trashed 文件",
         "btn_formats": "图片格式…",
         "lbl_group": "文件夹分组:",
         "group_flat": "单层格式",
@@ -921,8 +1138,9 @@ STRINGS = {
         "tip_copy_mode": "文件复制到日期文件夹，原文件保留（默认是移动）",
         "tip_prefix": "重名冲突时自动加来源文件夹名前缀：文件夹名_IMG_001.jpg；顶层文件用源文件夹名，仍冲突则追加序号",
         "tip_recursive": "递归扫描源文件夹内所有子文件夹；不勾选只处理源文件夹顶层文件",
-        "tip_cleanup_parts": "整理开始时清理目标目录下上次中断遗留的半成品文件（.po-tmp）",
+        "tip_cleanup_parts": "整理开始时清理目标目录下上次中断遗留的半成品文件（.photo-org-tmp）",
         "tip_skip_existing": "仅勾选“包含子文件夹”且源=目标（原地整理）时生效：源目录下已有的日期文件夹视为已整理，其中文件直接跳过，不判断文件日期（EXIF/文件名）",
+        "tip_hidden_trash": "勾选后才会整理隐藏文件与 .trashed 文件。隐藏判定跨平台：Windows 隐藏属性或文件名以点开头；.trashed 为 Android 回收站文件（文件名以 .trashed- 开头），优先于隐藏判定、不叠加。默认不勾选，避免误整理回收站文件。",
         "tip_formats": "勾选要整理哪些图片格式，可自定义添加其他格式",
         "tip_group": "目标文件夹的整理方式：单层日期文件夹，或按 年/月/日 嵌套",
         "tip_date_folder": "在 年/月/日 层级分组的最内层，再按日期格式创建文件夹",
@@ -939,10 +1157,10 @@ STRINGS = {
         "tip_keep": "保留最近几份操作清单，超出部分自动删除",
         "tip_mono": "关闭彩色标签，日志以纯文本显示",
         "btn_clean_parts": "清理半成品",
-        "tip_clean_parts_btn": "扫描并删除目标目录下上次中断遗留的半成品文件（.po-tmp），逐条输出删除结果",
+        "tip_clean_parts_btn": "扫描并删除目标目录下上次中断遗留的半成品文件（.photo-org-tmp），逐条输出删除结果",
         "log_clean_parts_scan": "[信息] 扫描目标目录下的半成品文件...",
         "msg_clean_parts_none": "[信息] 没有残留的半成品文件需要清理",
-        "msg_clean_parts_confirm": "将在目标目录下删除 {n} 个半成品文件（.po-tmp）。确定删除？",
+        "msg_clean_parts_confirm": "将在目标目录下删除 {n} 个半成品文件（.photo-org-tmp）。确定删除？",
         "log_clean_parts_done": "[信息] 半成品清理完成，共删除 {n} 个文件",
         "tip_log_combo": "选择一份历史操作清单：日志窗口顶部会提示选中项与动作条数，可用于显示明细 / 导出 / 还原变更（按保存时间倒序）",
         "tip_show_detail": "在下方日志窗口显示选中操作清单的完整明细（会话信息 + 每条动作）",
@@ -989,31 +1207,31 @@ STRINGS = {
         "tag_copy": "[复制]",
         "tag_rename": "[重命名]",
         "tag_info": "[信息]",
+        "tag_tip": "[提示]",
+        "tag_hidden": "[隐藏]",
+        "tag_trash": "[Trash]",
+        "tag_video": "[视频]",
         "tag_delete": "[删除]",
         "err_src_missing": "[错误] 源文件夹不存在: ",
         "err_src_not_dir": "[错误] 源路径不是文件夹: ",
         "err_dest_missing": "[错误] 目标文件夹不存在: ",
         "err_dest_not_dir": "[错误] 目标路径不是文件夹: ",
+        "log_dest_created": "[信息] 目标文件夹不存在，已自动创建: ",
+        "err_dest_create": "[错误] 目标文件夹创建失败: ",
         "err_bad_fmt": "[错误] 日期格式无效: ",
         "warn_pil_pre": "[警告] Pillow 未加载成功（原因: ",
         "unknown_err": "未知错误",
         "warn_pil_post": "），无法读取 EXIF 拍摄时间，将改用文件名/文件时间兜底判定。请安装或修复 Pillow（pip install pillow）后 EXIF 判定才可用。",
         "info_no_files": "[提示] 源文件夹下没有照片文件",
         "incl_subfolders": "（含子文件夹）",
-        "info_skip_need_recursive": "[提示] “跳过已有日期文件夹”仅在勾选“包含子文件夹”时生效，本次忽略该选项",
-        "info_skip_need_inplace": "[提示] “跳过已有日期文件夹”仅在源=目标（原地整理）时生效，本次忽略该选项",
+        "info_skip_need_recursive": "“跳过已有日期文件夹”仅在勾选“包含子文件夹”时生效，本次忽略该选项",
+        "info_skip_need_inplace": "“跳过已有日期文件夹”仅在源=目标（原地整理）时生效，本次忽略该选项",
         "info_detect_pre": "[提示] 检测到 ",
-        "info_leftover_post": " 个上次中断遗留的半成品文件（真实运行时将自动清理）",
-        "cleanup_removed_pre": "[清理] 移除 ",
-        "cleanup_removed_post": " 个上次中断遗留的半成品文件",
         "info_skip_dirs_post": " 个已有日期文件夹，内部文件将视为已整理直接跳过",
         "warn_scan_dirs": "[警告] 扫描已有日期文件夹失败: ",
-        "skip_in_place": "[跳过] 已在目标位置: ",
         "skip_in_place_post": "（已有日期文件夹，视为已整理）",
-        "skip_no_date": "[跳过] 无法识别日期: ",
-        "skip_exists": "[跳过] 已存在: ",
-        "sim_will": "[模拟] 将",
-        "err_failed": "[错误] 处理失败: ",
+        "skip_no_date_post": "（无法识别日期）",
+        "skip_exists_post": "（重名已存在）",
         "mode_copy_done": "复制完成",
         "mode_org_done": "整理完成",
         "sum_move": "移动: ",
@@ -1023,6 +1241,8 @@ STRINGS = {
         "unit_zhang": " 张",
         "sum_new_dirs": "新建日期文件夹: ",
         "unit_ge": " 个",
+        "sum_hidden_pre": "扫描到隐藏文件 ",
+        "sum_trash_sep": " 个 | .trashed 文件 ",
         "sum_exif": "EXIF 判定: ",
         "sum_fallback_sep": " 张 | 兜底判定: ",
         "detail_title": "\n处理明细:",
@@ -1034,6 +1254,8 @@ STRINGS = {
         "detail_skip_pre": "跳过明细: 已在目标位置 ",
         "detail_skip_dup_sep": " 张 | 重名已存在 ",
         "detail_skip_nodate_sep": " 张 | 无法识别日期 ",
+        "detail_skip_hidden_sep": " 张 | 隐藏跳过 ",
+        "detail_skip_trash_sep": " 张 | .trashed 跳过 ",
         "err_read_sel": "[错误] 无法读取操作清单 ",
         "sel_log_pre": "已选择操作清单 ",
         "sel_log_post": " 条动作）",
@@ -1061,16 +1283,21 @@ STRINGS = {
         "log_clear_fail": "[日志] 清空失败：部分文件未能删除",
         "err_read_log": "读取操作清单失败: ",
         "err_no_actions": "缺少操作清单文件（.jsonl），无法还原；该日志可能未记录文件动作",
+        "err_restore_scope": "日志缺少有效的会话目录信息，为安全起见拒绝还原",
+        "warn_restore_skip_scope": "[警告] 路径超出会话目录范围，已跳过还原: ",
         "skip_dst_missing": "[跳过] 目标文件已不存在: ",
         "skip_src_exists": "[跳过] 原位置已有文件，避免覆盖: ",
         "restore_move_pre": "[还原] ",
         "err_restore": "[错误] 还原失败: ",
+        "err_move_src_rm": "[错误] 跨盘移动失败：目标已写入但无法删除源文件: ",
+        "err_worker_crash": "[错误] 整理过程异常: ",
         "restore_rm_copy": "[还原] 删除复制副本: ",
         "err_rm_copy": "[错误] 删除副本失败: ",
         "skip_copy_missing": "[跳过] 副本已不存在: ",
         "line_src": "源文件夹: ",
         "line_dest": "目标文件夹: ",
         "line_video": "整理视频: ",
+        "line_hidden_trash": "包含隐藏/.trashed 文件: ",
         "line_mode_sep": " | 模式: ",
         "line_recursive": "包含子文件夹: ",
         "line_conflict_sep": " | 重名处理: ",
@@ -1096,8 +1323,10 @@ STRINGS = {
         "log_saved": "[日志] 已保存操作清单: ",
         "err_save_log": "[日志] 保存操作清单失败: ",
         "win_fmt_help": "日期格式说明",
+        "log_fmt_help_pre": "以下为日期格式说明：",
+        "log_help_body_pre": "以下为命令行用法说明：",
         "fmt_help_body": "【常用记号】（Python strftime 格式）\n%Y = 四位年份   → 2026\n%y = 两位年份   → 26\n%m = 两位月份   → 10\n%d = 两位日期   → 20\n%H = 小时(24h)  → 14\n%M = 分钟       → 30\n%S = 秒         → 05\n\n【常用组合示例】\n%Y         → 2026        （按年）\n%Y-%m      → 2026-10     （按月）\n%Y-%m-%d   → 2026-10-20  （按日）\n%Y年%m月%d日 → 2026年10月20日（中文）\n%Y/%m/%d   → 2026/10/20  （斜杠分隔）\n%Y.%m.%d   → 2026.10.20  （点号分隔）\n\n【小提示】\n连接符可以用 -  /  .  空格，也可以写中文。\n想按年就 %Y，按月 %Y-%m，按日 %Y-%m-%d。\n",
-        "help_body": "用法:\n  photo-organizer [源文件夹] [目标文件夹] [选项]\n\n不带参数运行 → 自动打开图形界面；带参数运行 → 命令行模式\n\n【位置参数】\n  source_dir    源文件夹（从中读取照片）\n  dest_dir      目标文件夹（不提供时使用配置区 DEST_DIR）\n\n【常用选项】\n  -g, --gui                     强制启动图形界面\n  --dry-run                     模拟运行，只预览归类结果，不移动文件\n  --copy                        复制模式，原文件保留（默认移动）\n  -r, --recursive               递归扫描源文件夹的所有子文件夹\n  --prefix                      重名冲突时自动加来源文件夹名前缀\n  --skip-existing-date-folders  仅原地整理时跳过已有日期文件夹（默认启用）\n  --no-skip-existing-date-folders  关闭“跳过已有日期文件夹”\n  --date-folder                 层级分组时最内层再建日期文件夹\n  --date-format 格式            单层日期文件夹格式，默认 %Y-%m-%d\n  --group 层级                  year / year-month / year-month-day\n  --year-format / --month-format / --day-format  各层文件夹名格式\n  --add-photo-ext .raw          额外增加图片扩展名（可多次）\n  --remove-photo-ext .gif       临时排除图片扩展名（可多次）\n  --save-log                    保存操作清单到 jsonl（默认不保存）\n  --cleanup-parts               手动清理目标目录下的 .po-tmp 半成品（逐条输出删除）\n  --version                     显示版本号\n",
+        "help_body": "用法:\n  photo-organizer [源文件夹] [目标文件夹] [选项]\n\n不带参数运行 → 自动打开图形界面；带参数运行 → 命令行模式\n\n【位置参数】\n  source_dir    源文件夹（从中读取照片）\n  dest_dir      目标文件夹（不提供时使用配置区 DEST_DIR）\n\n【常用选项】\n  -g, --gui                     强制启动图形界面\n  --dry-run                     模拟运行，只预览归类结果，不移动文件\n  --copy                        复制模式，原文件保留（默认移动）\n  -r, --recursive               递归扫描源文件夹的所有子文件夹\n  --prefix                      重名冲突时自动加来源文件夹名前缀\n  --skip-existing-date-folders  仅原地整理时跳过已有日期文件夹（默认启用）\n  --no-skip-existing-date-folders  关闭“跳过已有日期文件夹”\n  --date-folder                 层级分组时最内层再建日期文件夹\n  --date-format 格式            单层日期文件夹格式，默认 %Y-%m-%d\n  --group 层级                  year / year-month / year-month-day\n  --year-format / --month-format / --day-format  各层文件夹名格式\n  --add-photo-ext .raw          额外增加图片扩展名（可多次）\n  --remove-photo-ext .gif       临时排除图片扩展名（可多次）\n  --no-exif                     跳过 EXIF 读取，直接按文件名/文件时间判定（大批量时更快）\n  --include-hidden-trash        整理隐藏文件与 .trashed 文件（默认不处理）\n  --save-log                    保存操作清单到 jsonl（默认不保存）\n  --cleanup-parts               手动清理目标目录下的 .photo-org-tmp 半成品（逐条输出删除）\n  --clear-logs / --clear-data   清空操作清单 / 清理数据，均需附带 --yes 确认\n  --version                     显示版本号\n",
         "prog_desc": "照片按拍摄日期归类脚本（命令行 + 图形界面）",
         "arg_version": "显示版本号",
         "arg_src": "源文件夹（从中读取照片）；不提供且无其它参数时自动打开图形界面",
@@ -1105,11 +1334,9 @@ STRINGS = {
         "arg_dry_run": "模拟运行，只预览归类结果，不移动任何文件（命令行模式）",
         "arg_copy_mode": "复制模式：文件复制到日期文件夹，原文件保留（默认移动）",
         "arg_recursive": "递归扫描源文件夹的所有子文件夹",
-        "arg_skip_existing": "仅原地整理（源=目标）时生效：跳过源目录下已有的日期文件夹，其中文件视为已整理（不判断日期）；默认启用",
-        "arg_no_skip_existing": "关闭“跳过已有日期文件夹”（默认启用，加本参数可关闭）",
+        "arg_skip_existing": "仅原地整理（源=目标）时生效：跳过源目录下已有的日期文件夹，其中文件视为已整理（不判断日期）；默认启用，加 --no-skip-existing-date-folders 可关闭",
         "arg_prefix": "重名冲突时自动加来源文件夹名前缀（默认跳过）",
         "arg_date_folder": "层级分组时，在分组得到的最内层文件夹里再建日期文件夹（按 --date-format，默认 %%Y-%%m-%%d）",
-        "arg_no_cleanup": "关闭启动时自动清理上次中断遗留的半成品文件（.po-tmp）",
         "arg_date_fmt": "单层日期文件夹格式（strftime），如 %%Y 按年、%%Y-%%m 按月、%%Y-%%m-%%d 按日；默认 %%Y-%%m-%%d",
         "arg_group": "层级嵌套分组：year=先按年建文件夹、year-month=年>月、year-month-day=年>月>日",
         "arg_year_fmt": "层级分组时年层文件夹名格式（strftime），默认 %%Y",
@@ -1117,11 +1344,14 @@ STRINGS = {
         "arg_day_fmt": "层级分组时日层文件夹名格式（strftime），默认 %%d",
         "arg_add_ext": "额外增加要整理的图片扩展名（可多次使用），如 --add-photo-ext .raw",
         "arg_remove_ext": "临时排除图片扩展名（可多次使用，仅在本次运行生效），如 --remove-photo-ext .gif",
+        "arg_no_exif": "跳过 EXIF 读取，仅依据文件名与系统时间整理（速度更快）",
+        "arg_yes": "直接确认高危操作（--clear-logs / --clear-data 必须附带）",
+        "msg_need_yes": "该操作不可逆，请附带 --yes 明确确认后执行",
         "arg_gui": "强制启动图形界面",
         "arg_no_video": "不整理视频（默认同时整理图片与视频）",
+        "arg_include_hidden_trash": "整理隐藏文件与 .trashed 文件（Android 回收站文件，文件名以 .trashed- 开头；默认不处理）",
         "arg_lang": "界面/输出语言：zh 或 en（默认按配置或 zh）",
         "arg_save_log": "保存操作清单到 jsonl（默认不保存，需显式指定）",
-        "arg_no_save_log": "不保存操作清单（默认即不保存）",
         "arg_log_keep": "保留最近 N 份操作清单（默认 30）",
         "arg_reset_config": "恢复默认配置（删除配置文件）",
         "arg_list_logs": "列出最近保存的操作清单",
@@ -1129,7 +1359,7 @@ STRINGS = {
         "arg_rollback": "按指定操作清单还原变更（移动移回，复制删除副本）",
         "arg_clear_logs": "清空全部操作清单（逐条输出删除）",
         "arg_clear_data": "清理数据：删除配置文件与全部操作清单",
-        "arg_cleanup_parts": "手动清理目标目录下的半成品文件（.po-tmp，逐条输出删除）",
+        "arg_cleanup_parts": "手动清理目标目录下的半成品文件（.photo-org-tmp，逐条输出删除）",
         "arg_mono": "单色输出（关闭彩色标签）",
         "lang_switch_btn": "English",
         "tip_lang_switch": "切换到英文界面，选择会保存并在下次启动时沿用",
@@ -1149,23 +1379,19 @@ STRINGS = {
         "lbl_src": "Source folder:",
         "lbl_dest": "Target folder:",
         "btn_browse": "Browse...",
-        "btn_clear_paths": "Clear path history",
-        "tip_clear_paths": "Clear remembered source/target folder history in config (records only; never deletes real folders)",
-        "msg_clear_paths_confirm": "This will clear the remembered source/target folder history in config.\nIt only deletes memory; no real folders or files will be removed.\n\nConfirm clearing?",
-        "log_paths_cleared": "[Paths] Cleared source/target folder history",
         "chk_video": "Also organize videos",
         "chk_copy_mode": "Copy mode",
         "chk_prefix": "Auto-prefix on name conflict",
         "chk_recursive": "Include subfolders",
-        "chk_cleanup_parts": "Clean up partial files on start",
         "chk_skip_existing": "Skip existing date folders",
+        "chk_hidden_trash": "Include hidden and .trashed files",
         "btn_formats": "Image formats...",
         "lbl_group": "Folder grouping:",
         "group_flat": "Flat format",
         "group_year": "By year",
         "group_ym": "By year+month",
         "group_ymd": "By year+month+day",
-        "chk_date_folder": "Create date folders in grouping",
+        "chk_date_folder": "Create date folder when grouping",
         "btn_fmt_help": "Format help",
         "btn_help": "Help",
         "lbl_date_fmt": "Date format:",
@@ -1207,8 +1433,9 @@ STRINGS = {
         "tip_copy_mode": "Files are copied to date folders, originals kept (default is move)",
         "tip_prefix": "On name conflict, auto-add source folder name prefix: Folder_IMG_001.jpg; top-level files use the source folder name, append a sequence number if still conflicting",
         "tip_recursive": "Recursively scan all subfolders in source; uncheck to process only top-level files",
-        "tip_cleanup_parts": "On start, clean up leftover partial files (.po-tmp) from an interrupted run in target",
+        "tip_cleanup_parts": "On start, clean up leftover partial files (.photo-org-tmp) from an interrupted run in target",
         "tip_skip_existing": "Only active when 'Include subfolders' is checked and source=target (in-place): existing date folders are treated as organized and skipped without checking file dates",
+        "tip_hidden_trash": "Check to also organize hidden files and .trashed files. Hidden detection is cross-platform: Windows hidden attribute or a leading dot; .trashed files are Android recycle-bin files (names starting with '.trashed-'), which take priority over hidden and are not double-tagged. Unchecked by default to avoid mis-sorting recycle-bin files.",
         "tip_formats": "Choose which image formats to organize; custom formats can be added",
         "tip_group": "How to organize target: flat date folder, or nested by year/month/day",
         "tip_date_folder": "At the innermost level of year/month/day grouping, also create folders by date format",
@@ -1225,10 +1452,10 @@ STRINGS = {
         "tip_keep": "Keep the most recent N operation logs; older ones are auto-deleted",
         "tip_mono": "Disable colored labels, plain text output",
         "btn_clean_parts": "Clean up partials",
-        "tip_clean_parts_btn": "Scan and delete leftover partial files (.po-tmp) in the target folder, one line per deletion",
+        "tip_clean_parts_btn": "Scan and delete leftover partial files (.photo-org-tmp) in the target folder, one line per deletion",
         "log_clean_parts_scan": "[Info] Scanning target folder for partial files...",
         "msg_clean_parts_none": "[Info] No leftover partial files to clean",
-        "msg_clean_parts_confirm": "This will delete {n} partial file(s) (.po-tmp) in the target folder. Continue?",
+        "msg_clean_parts_confirm": "This will delete {n} partial file(s) (.photo-org-tmp) in the target folder. Continue?",
         "log_clean_parts_done": "[Info] Partial cleanup done, {n} file(s) deleted",
         "tip_log_combo": "Pick a historical operation log; the log window shows the selected item and action count. Use it to view details / export / rollback (newest first)",
         "tip_show_detail": "Show the full details of the selected operation log in the log window below (session info + each action)",
@@ -1275,31 +1502,31 @@ STRINGS = {
         "tag_copy": "[Copy]",
         "tag_rename": "[Rename]",
         "tag_info": "[Info]",
+        "tag_tip": "[Info]",
+        "tag_hidden": "[Hidden]",
+        "tag_trash": "[Trash]",
+        "tag_video": "[Video]",
         "tag_delete": "[Delete]",
         "err_src_missing": "[Error] Source folder does not exist: ",
         "err_src_not_dir": "[Error] Source path is not a folder: ",
         "err_dest_missing": "[Error] Target folder does not exist: ",
         "err_dest_not_dir": "[Error] Target path is not a folder: ",
+        "log_dest_created": "[Info] Target folder did not exist; created automatically: ",
+        "err_dest_create": "[Error] Failed to create target folder: ",
         "err_bad_fmt": "[Error] Invalid date format: ",
         "warn_pil_pre": "[Warning] Pillow failed to load (reason: ",
         "unknown_err": "unknown error",
         "warn_pil_post": "), EXIF capture time cannot be read; falling back to filename/file time. Install or fix Pillow (pip install pillow) to enable EXIF detection.",
         "info_no_files": "[Info] No photo files in the source folder",
         "incl_subfolders": " (including subfolders)",
-        "info_skip_need_recursive": "[Info] 'Skip existing date folders' only works when 'Include subfolders' is checked; ignored this time",
-        "info_skip_need_inplace": "[Info] 'Skip existing date folders' only works when source=target (in-place); ignored this time",
+        "info_skip_need_recursive": "'Skip existing date folders' only works when 'Include subfolders' is checked; ignored this time",
+        "info_skip_need_inplace": "'Skip existing date folders' only works when source=target (in-place); ignored this time",
         "info_detect_pre": "[Info] Detected ",
-        "info_leftover_post": " leftover partial file(s) from an interrupted run (auto-cleaned on real run)",
-        "cleanup_removed_pre": "[Cleanup] Removed ",
-        "cleanup_removed_post": " leftover partial file(s) from an interrupted run",
         "info_skip_dirs_post": " existing date folder(s); files inside will be treated as organized and skipped",
         "warn_scan_dirs": "[Warning] Failed to scan existing date folders: ",
-        "skip_in_place": "[Skip] Already at target location: ",
         "skip_in_place_post": " (existing date folder, treated as organized)",
-        "skip_no_date": "[Skip] Cannot identify date: ",
-        "skip_exists": "[Skip] Already exists: ",
-        "sim_will": "[Dry run] Will ",
-        "err_failed": "[Error] Failed to process: ",
+        "skip_no_date_post": " (cannot identify date)",
+        "skip_exists_post": " (duplicate exists)",
         "mode_copy_done": "Copy complete",
         "mode_org_done": "Organizing complete",
         "sum_move": "Moved: ",
@@ -1309,6 +1536,8 @@ STRINGS = {
         "unit_zhang": "",
         "sum_new_dirs": "New date folders: ",
         "unit_ge": "",
+        "sum_hidden_pre": "Hidden files found: ",
+        "sum_trash_sep": " | .trashed files: ",
         "sum_exif": "EXIF: ",
         "sum_fallback_sep": " | Fallback: ",
         "detail_title": "\nDetails:",
@@ -1320,6 +1549,8 @@ STRINGS = {
         "detail_skip_pre": "Skip details: already in target ",
         "detail_skip_dup_sep": " | duplicate exists ",
         "detail_skip_nodate_sep": " | cannot identify date ",
+        "detail_skip_hidden_sep": " | hidden skipped ",
+        "detail_skip_trash_sep": " | .trashed skipped ",
         "err_read_sel": "[Error] Cannot read operation log ",
         "sel_log_pre": "Selected operation log ",
         "sel_log_post": " actions)",
@@ -1347,16 +1578,21 @@ STRINGS = {
         "log_clear_fail": "[Log] Clear failed: some files could not be deleted",
         "err_read_log": "Failed to read operation log: ",
         "err_no_actions": "No operation log file (.jsonl); cannot rollback. The log may not have recorded file actions",
+        "err_restore_scope": "Log lacks valid session folder info; rollback refused for safety",
+        "warn_restore_skip_scope": "[Warning] Path outside session folders; rollback skipped: ",
         "skip_dst_missing": "[Skip] Target file no longer exists: ",
         "skip_src_exists": "[Skip] Original location already has a file; avoiding overwrite: ",
         "restore_move_pre": "[Restore] ",
         "err_restore": "[Error] Rollback failed: ",
+        "err_move_src_rm": "[Error] Cross-drive move failed: target written but source could not be removed: ",
+        "err_worker_crash": "[Error] Organizing process crashed: ",
         "restore_rm_copy": "[Restore] Deleting copy: ",
         "err_rm_copy": "[Error] Failed to delete copy: ",
         "skip_copy_missing": "[Skip] Copy no longer exists: ",
         "line_src": "Source folder: ",
         "line_dest": "Target folder: ",
         "line_video": "Videos: ",
+        "line_hidden_trash": "Include hidden/.trashed files: ",
         "line_mode_sep": " | Mode: ",
         "line_recursive": "Include subfolders: ",
         "line_conflict_sep": " | Name conflict: ",
@@ -1382,8 +1618,10 @@ STRINGS = {
         "log_saved": "[Log] Saved operation log: ",
         "err_save_log": "[Log] Failed to save operation log: ",
         "win_fmt_help": "Date Format Reference",
+        "log_fmt_help_pre": "Date format reference:",
+        "log_help_body_pre": "Command-line usage:",
         "fmt_help_body": "[Common markers] (Python strftime)\n%Y = 4-digit year  -> 2026\n%y = 2-digit year  -> 26\n%m = 2-digit month -> 10\n%d = 2-digit day   -> 20\n%H = hour (24h)    -> 14\n%M = minute        -> 30\n%S = second        -> 05\n\n[Common combinations]\n%Y        -> 2026        (by year)\n%Y-%m     -> 2026-10     (by month)\n%Y-%m-%d  -> 2026-10-20  (by day)\n%Y年%m月%d日 -> 2026年10月20日 (Chinese)\n%Y/%m/%d  -> 2026/10/20  (slash separated)\n%Y.%m.%d  -> 2026.10.20  (dot separated)\n\n[Tips]\nSeparators can be - / . space, or Chinese characters.\nBy year use %Y, by month %Y-%m, by day %Y-%m-%d.\n",
-        "help_body": "Usage:\n  photo-organizer [SOURCE] [DEST] [OPTIONS]\n\nRunning without arguments opens the GUI; with arguments runs CLI mode.\n\n[Positional arguments]\n  source_dir    Source folder (photos are read from here)\n  dest_dir      Target folder (uses DEST_DIR from config if omitted)\n\n[Common options]\n  -g, --gui                     Force launch GUI\n  --dry-run                     Dry run: only preview, do not move files\n  --copy                        Copy mode: originals kept (default is move)\n  -r, --recursive               Recursively scan all subfolders\n  --prefix                      Auto-add source folder name prefix on conflict\n  --skip-existing-date-folders  In-place only: skip existing date folders (enabled by default)\n  --no-skip-existing-date-folders  disable skip-existing (enabled by default)\n  --date-folder                 Also create date folders at innermost level\n  --date-format FMT             Flat date folder format, default %Y-%m-%d\n  --group LEVEL                 year / year-month / year-month-day\n  --year-format / --month-format / --day-format  per-level folder name format\n  --add-photo-ext .raw          Add an image extension (repeatable)\n  --remove-photo-ext .gif       Temporarily exclude an extension (repeatable)\n  --save-log                    Save operation log to jsonl (default: do not save)\n  --cleanup-parts               Manually clean .po-tmp partials in target (one line per deletion)\n  --version                     Show version\n",
+        "help_body": "Usage:\n  photo-organizer [SOURCE] [DEST] [OPTIONS]\n\nRunning without arguments opens the GUI; with arguments runs CLI mode.\n\n[Positional arguments]\n  source_dir    Source folder (photos are read from here)\n  dest_dir      Target folder (uses DEST_DIR from config if omitted)\n\n[Common options]\n  -g, --gui                     Force launch GUI\n  --dry-run                     Dry run: only preview, do not move files\n  --copy                        Copy mode: originals kept (default is move)\n  -r, --recursive               Recursively scan all subfolders\n  --prefix                      Auto-add source folder name prefix on conflict\n  --skip-existing-date-folders  In-place only: skip existing date folders (enabled by default)\n  --no-skip-existing-date-folders  disable skip-existing (enabled by default)\n  --date-folder                 Also create date folders at innermost level\n  --date-format FMT             Flat date folder format, default %Y-%m-%d\n  --group LEVEL                 year / year-month / year-month-day\n  --year-format / --month-format / --day-format  per-level folder name format\n  --add-photo-ext .raw          Add an image extension (repeatable)\n  --remove-photo-ext .gif       Temporarily exclude an extension (repeatable)\n  --no-exif                     Skip EXIF, use filename/file time only (faster for large batches)\n  --include-hidden-trash        Organize hidden and .trashed files (default: skip)\n  --save-log                    Save operation log to jsonl (default: do not save)\n  --cleanup-parts               Manually clean .photo-org-tmp partials in target (one line per deletion)\n  --clear-logs / --clear-data   Clear logs / wipe data; both require --yes\n  --version                     Show version\n",
         "prog_desc": "Photo organizer by capture date (CLI + GUI)",
         "arg_version": "show version",
         "arg_src": "source folder (photos are read from here); if omitted and no other arguments, opens GUI",
@@ -1391,11 +1629,9 @@ STRINGS = {
         "arg_dry_run": "dry run: only preview, move no files (CLI mode)",
         "arg_copy_mode": "copy mode: files copied to date folders, originals kept (default is move)",
         "arg_recursive": "recursively scan all subfolders of source",
-        "arg_skip_existing": "in-place only (source=target): skip existing date folders, treat their files as organized (no date check); enabled by default",
-        "arg_no_skip_existing": "disable 'skip existing date folders' (enabled by default; add this to turn it off)",
+        "arg_skip_existing": "in-place only (source=target): skip existing date folders, treat their files as organized (no date check); enabled by default, add --no-skip-existing-date-folders to disable",
         "arg_prefix": "auto-add source folder name prefix on name conflict (default: skip)",
         "arg_date_folder": "with hierarchical grouping, also create date folders at the innermost level (per --date-format, default %%Y-%%m-%%d)",
-        "arg_no_cleanup": "disable auto-cleanup of leftover partial files (.po-tmp)",
         "arg_date_fmt": "flat date folder format (strftime), e.g. %%Y by year, %%Y-%%m by month, %%Y-%%m-%%d by day; default %%Y-%%m-%%d",
         "arg_group": "hierarchical grouping: year=by year, year-month=year>month, year-month-day=year>month>day",
         "arg_year_fmt": "year-level folder name format (strftime), default %%Y",
@@ -1403,11 +1639,14 @@ STRINGS = {
         "arg_day_fmt": "day-level folder name format (strftime), default %%d",
         "arg_add_ext": "add an image extension to organize (repeatable), e.g. --add-photo-ext .raw",
         "arg_remove_ext": "temporarily exclude an image extension (repeatable, current run only), e.g. --remove-photo-ext .gif",
+        "arg_no_exif": "skip EXIF reading; organize by filename and system time only (faster)",
+        "arg_yes": "confirm high-risk operations explicitly (required for --clear-logs / --clear-data)",
+        "msg_need_yes": "This operation is irreversible; append --yes to confirm",
         "arg_gui": "force launching GUI",
         "arg_no_video": "do not organize videos (default: organize images and videos)",
+        "arg_include_hidden_trash": "organize hidden and .trashed files (Android recycle-bin files named '.trashed-*'; skipped by default)",
         "arg_lang": "interface/output language: zh or en (default: config or zh)",
         "arg_save_log": "save operation log to jsonl (default: do not save; specify explicitly)",
-        "arg_no_save_log": "do not save operation log (default is not saving)",
         "arg_log_keep": "keep the most recent N operation logs (default 30)",
         "arg_reset_config": "restore default config (delete config file)",
         "arg_list_logs": "list the most recent operation logs",
@@ -1415,7 +1654,7 @@ STRINGS = {
         "arg_rollback": "roll back changes by the given operation log (move back / delete copies)",
         "arg_clear_logs": "clear all operation logs (print one line per deletion)",
         "arg_clear_data": "clear data: delete config file and all operation logs",
-        "arg_cleanup_parts": "manually clean partial files (.po-tmp) in target folder (one line per deletion)",
+        "arg_cleanup_parts": "manually clean partial files (.photo-org-tmp) in target folder (one line per deletion)",
         "arg_mono": "monochrome output (disable colored labels)",
         "lang_switch_btn": "中文",
         "tip_lang_switch": "Switch to Chinese interface; your choice is saved and reused on next launch",
@@ -1536,7 +1775,7 @@ class _ToolTip:
 
 
 class PhotoOrganizerApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: "tk.Tk"):
         self.root = root
         self.log_q = queue.Queue()
         self.running = False
@@ -1549,7 +1788,7 @@ class PhotoOrganizerApp:
         """构建全部界面控件（语言切换后整体重建并恢复状态）。"""
         root = self.root
         self.root.title(f"{_t('win_title')} v{__version__}")
-        self.root.geometry("680x560")
+        self.root.geometry("680x600")
         self.root.minsize(560, 460)
 
         # 语言切换栏：窗口顶部右侧，按钮文字显示目标语言（中文界面显 English，英文界面显 中文）
@@ -1619,6 +1858,11 @@ class PhotoOrganizerApp:
                                                    variable=self.skip_existing_var)
         self.skip_existing_check.pack(side=tk.LEFT, padx=(16, 0))
         _ToolTip(self.skip_existing_check, _t("tip_skip_existing"))
+        self.hidden_trash_var = tk.BooleanVar(value=False)
+        self.hidden_trash_check = ttk.Checkbutton(opts2, text=_t("chk_hidden_trash"),
+                                                  variable=self.hidden_trash_var)
+        self.hidden_trash_check.pack(side=tk.LEFT, padx=(16, 0))
+        _ToolTip(self.hidden_trash_check, _t("tip_hidden_trash"))
         self._refresh_skip_existing_state()
         # 图片格式按钮：点开弹窗勾选支持的图片格式
         self.fmt_btn = ttk.Button(opts2, text=_t("btn_formats"), command=self.open_format_dialog)
@@ -1692,13 +1936,6 @@ class PhotoOrganizerApp:
         self.clean_parts_btn = ttk.Button(self.btns, text=_t("btn_clean_parts"), command=self.on_clean_parts)
         self.clean_parts_btn.pack(side=tk.LEFT, padx=(0, 8))
         _ToolTip(self.clean_parts_btn, _t("tip_clean_parts_btn"))
-        self.status_var = tk.StringVar(value=_t("status_ready"))
-        self.status_lbl = tk.Label(self.btns, textvariable=self.status_var,
-                                   bg=ttk.Style().lookup("TFrame", "background"))
-        self.status_lbl.pack(side=tk.LEFT, padx=12)
-        if not HAS_PIL:
-            self.status_var.set(_t("status_pil_err"))
-            self.status_lbl.configure(fg="#c00000")
 
         # 日志功能区（保存选项 + 保留份数）
         log_opts_row = ttk.Frame(root, padding=(10, 2, 10, 0))
@@ -1712,7 +1949,7 @@ class PhotoOrganizerApp:
         ttk.Checkbutton(log_opts_row, text=_t("chk_mono"), variable=self.mono_var).pack(side=tk.LEFT, padx=(12, 0))
         _ToolTip(log_opts_row.winfo_children()[-1], _t("tip_mono"))
         ttk.Label(log_opts_row, text=_t("lbl_keep")).pack(side=tk.LEFT, padx=(12, 0))
-        self.log_keep_var = tk.StringVar(value="30")
+        self.log_keep_var = tk.StringVar(value=str(DEFAULT_LOG_KEEP))
         self.log_keep_spin = ttk.Spinbox(log_opts_row, from_=1, to=50, width=4,
                                          textvariable=self.log_keep_var)
         self.log_keep_spin.pack(side=tk.LEFT)
@@ -1746,11 +1983,21 @@ class PhotoOrganizerApp:
         ttk.Button(log_row, text=_t("btn_clear_data"), command=self.on_clear_data).pack(side=tk.LEFT, padx=(8, 0))
         _ToolTip(log_row.winfo_children()[-1], _t("tip_clear_data"))
 
+        # 底部独立状态栏：左侧状态文本（先于日志区 pack，固定贴底不被挤出窗口）
+        status_bar = ttk.Frame(root, padding=(10, 2, 10, 6))
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_var = tk.StringVar(value=_t("status_ready"))
+        self.status_lbl = ttk.Label(status_bar, textvariable=self.status_var)
+        self.status_lbl.pack(side=tk.LEFT)
+        if not HAS_PIL:
+            self.status_var.set(_t("status_pil_err"))
+            self.status_lbl.configure(foreground="#c00000")
+
         # 日志区
         log_frame = ttk.Frame(root, padding=(10, 4, 10, 10))
-        log_frame.pack(fill=tk.BOTH, expand=True)
         self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, state=tk.DISABLED)
         self.log_text.pack(fill=tk.BOTH, expand=True)
+        log_frame.pack(fill=tk.BOTH, expand=True)
         # 日志着色：错误/删除红 / 警告橙 / 跳过黄 / 模拟青 / 移动绿 / 复制蓝 / 重命名紫 / 信息蓝
         self.log_text.tag_configure("err", foreground="#c00000")
         self.log_text.tag_configure("warn", foreground="#ea580c")
@@ -1760,6 +2007,10 @@ class PhotoOrganizerApp:
         self.log_text.tag_configure("copy", foreground="#1f6feb")
         self.log_text.tag_configure("rename", foreground="#7c3aed")
         self.log_text.tag_configure("info", foreground="#1f6feb")
+        # 新增标签：提示/隐藏/回收站/视频
+        self.log_text.tag_configure("hidden", foreground="#6b7280")
+        self.log_text.tag_configure("trash", foreground="#d97706")
+        self.log_text.tag_configure("video", foreground="#0e7490")
         # 摘要标签：新建日期文件夹 青绿 / EXIF 判定 深蓝 / 兜底判定 棕
         self.log_text.tag_configure("dir", foreground="#0f766e")
         self.log_text.tag_configure("exif", foreground="#0369a1")
@@ -1919,7 +2170,7 @@ class PhotoOrganizerApp:
             messagebox.showerror(_t("title_error"), f"{_t('err_import')}{e}", parent=self.root)
 
     def on_log_restore(self):
-        """根据选中的操作清单还原变更：移动模式移回原位置，复制模式删除副本。"""
+        """根据选中的操作清单还原变更：移动模式移回原位置，复制模式删除副本（后台执行，避免 UI 冻结）。"""
         stem = self._selected_log_stem()
         if not stem:
             messagebox.showinfo(_t("title_info"), _t("msg_need_select"), parent=self.root)
@@ -1929,17 +2180,20 @@ class PhotoOrganizerApp:
                 f"{_t('rollback_confirm_pre')}{stem}{_t('rollback_confirm_post')}",
                 parent=self.root):
             return
-        self.log(f"{_t('log_rollback_start')}{stem}")
-        stats = restore_from_log(stem, log_func=self.log)
+        self._run_bg(
+            lambda logf: restore_from_log(stem, log_func=logf),
+            on_done=self._on_restore_done,
+            log_start=f"{_t('log_rollback_start')}{stem}")
+
+    def _on_restore_done(self, stats):
         if "error" in stats:
             messagebox.showerror(_t("title_error"), stats["error"], parent=self.root)
             return
-        self.log(f"还原完成: 移回 {stats['moved']} 个 | 删除副本 {stats['removed']} 个 | "
-                 f"跳过 {stats['skipped']} 个 | 目标文件已不存在 {stats['missing']} 个")
+        self.log(_rollback_done_msg(stats))
         self.root.bell()
 
     def on_log_clear(self):
-        """清空 logs 目录下的全部操作清单（需确认）。"""
+        """清空 logs 目录下的全部操作清单（需确认，后台执行避免 UI 冻结）。"""
         d = get_logs_dir()
         try:
             targets = [p for p in d.iterdir() if p.suffix.lower() == ".jsonl"]
@@ -1953,24 +2207,30 @@ class PhotoOrganizerApp:
                 f"{_t('clear_confirm_pre')}{len(targets)}{_t('clear_confirm_post')}",
                 parent=self.root):
             return
+        self._run_bg(
+            lambda logf: self._do_clear_logs(targets, logf),
+            on_done=self._on_clear_logs_done)
+
+    def _do_clear_logs(self, targets, logf):
         removed = 0
-        try:
-            for p in sorted(targets, key=lambda x: x.name):
-                try:
-                    p.unlink()
-                    removed += 1
-                    self.log(f"{_t('tag_delete')} {p.name}")
-                except OSError:
-                    pass
-        finally:
-            self._refresh_log_combo()
+        for p in sorted(targets, key=lambda x: x.name):
+            try:
+                p.unlink()
+                removed += 1
+                logf(f"{_t('tag_delete')} {p.name}")
+            except OSError:
+                pass
+        return removed
+
+    def _on_clear_logs_done(self, removed):
+        self._refresh_log_combo()
         if removed:
             self.log(f"{_t('log_cleared_pre')}{removed}{_t('log_cleared_post')}")
         else:
             self.log(_t("log_clear_fail"))
 
     def on_log_delete_selected(self):
-        """删除下拉框中选中的那一份操作清单（需确认）。"""
+        """删除下拉框中选中的那一份操作清单（需确认，后台执行避免 UI 冻结）。"""
         stem = self._selected_log_stem()
         if not stem:
             messagebox.showinfo(_t("title_info"), _t("msg_need_select"), parent=self.root)
@@ -1984,12 +2244,23 @@ class PhotoOrganizerApp:
                 f"{_t('clear_sel_confirm_pre')}{path.name}{_t('clear_sel_confirm_post')}",
                 parent=self.root):
             return
+        self._run_bg(
+            lambda logf: self._do_delete_log(path, logf),
+            on_done=self._on_delete_log_done)
+
+    def _do_delete_log(self, path, logf):
         try:
             path.unlink()
-            self.log(f"{_t('tag_delete')} {path.name}")
-            self._refresh_log_combo()
+            logf(f"{_t('tag_delete')} {path.name}")
         except OSError as e:
-            messagebox.showerror(_t("title_error"), f"{_t('err_export')}{e}", parent=self.root)
+            return {"error": f"{_t('err_export')}{e}"}
+        return None
+
+    def _on_delete_log_done(self, result):
+        if result and "error" in result:
+            messagebox.showerror(_t("title_error"), result["error"], parent=self.root)
+            return
+        self._refresh_log_combo()
 
     def on_clear_data(self):
         """清理数据：删除配置文件与全部操作清单（需确认）。"""
@@ -2022,8 +2293,37 @@ class PhotoOrganizerApp:
         self._refresh_log_combo()
         messagebox.showinfo(_t("title_info"), _t("log_clear_data_done").format(n=stats["logs"]), parent=self.root)
 
+    def _run_bg(self, job, on_done=None, log_start=None):
+        """后台线程执行耗时操作：日志经列表收集后回主线程回放，避免 Tk 控件跨线程写入。
+
+        - job: 后台执行函数，接收一个 logf 回调（线程内收集日志行）
+        - on_done: 主线程回调，接收 job 返回值（异常时收到 {"error": msg}）
+        - log_start: 可选，执行前在主线程输出的起始日志
+        """
+        logs: list = []
+
+        def collect(s):
+            logs.append(s)
+
+        def runner():
+            try:
+                result = job(collect)
+            except Exception as e:
+                result = {"error": str(e)}
+            self.root.after(0, lambda: self._finish_bg(logs, result, on_done))
+
+        if log_start:
+            self.log(log_start)
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _finish_bg(self, logs, result, on_done):
+        for s in logs:
+            self.log(s)
+        if on_done:
+            on_done(result)
+
     def on_clean_parts(self):
-        """手动清理目标目录下的半成品文件（.po-tmp）：扫描 → 确认 → 逐条输出 [删除]。"""
+        """手动清理目标目录下的半成品文件（.photo-org-tmp）：后台扫描 → 确认 → 后台删除，避免 UI 冻结。"""
         dest_dir = self.dest_var.get().strip()
         if not dest_dir:
             messagebox.showwarning(_t("title_info"), _t("msg_need_dest"))
@@ -2032,8 +2332,12 @@ class PhotoOrganizerApp:
         if not dest_root.exists():
             messagebox.showerror(_t("title_error"), f"{_t('err_dest_missing')}{dest_dir}", parent=self.root)
             return
-        self.log(_t("log_clean_parts_scan"))
-        parts = _cleanup_parts(dest_root)
+        self._run_bg(
+            lambda logf: _cleanup_parts(dest_root),
+            on_done=self._on_clean_scan_done,
+            log_start=_t("log_clean_parts_scan"))
+
+    def _on_clean_scan_done(self, parts):
         if not parts:
             self.log(_t("msg_clean_parts_none"))
             return
@@ -2042,14 +2346,22 @@ class PhotoOrganizerApp:
                 _t("msg_clean_parts_confirm").format(n=len(parts)),
                 parent=self.root):
             return
+        self._run_bg(
+            lambda logf: self._do_clean_parts(parts, logf),
+            on_done=self._on_clean_parts_done)
+
+    def _do_clean_parts(self, parts, logf):
         removed = 0
         for p in sorted(parts, key=lambda x: str(x)):
             try:
                 p.unlink()
                 removed += 1
-                self.log(f"{_t('tag_delete')} {p}")
+                logf(f"{_t('tag_delete')} {p}")
             except OSError:
                 pass
+        return removed
+
+    def _on_clean_parts_done(self, removed):
         self.log(_t("log_clean_parts_done").format(n=removed))
 
     # ---------- 配置持久化 ----------
@@ -2063,8 +2375,9 @@ class PhotoOrganizerApp:
             "copy_mode": False,
             "recursive": False,
             "skip_existing_date_folders": True,
+            "include_hidden_trash": False,
             "prefix_duplicates": False,
-            "group_mode": _t("group_flat"),
+            "group_mode": "flat",
             "date_fmt": "%Y-%m-%d",
             "year_fmt": "%Y",
             "month_fmt": "%m",
@@ -2092,8 +2405,9 @@ class PhotoOrganizerApp:
         self.copy_var.set(bool(cfg.get("copy_mode", False)))
         self.recursive_var.set(bool(cfg.get("recursive", False)))
         self.skip_existing_var.set(bool(cfg.get("skip_existing_date_folders", True)))
+        self.hidden_trash_var.set(bool(cfg.get("include_hidden_trash", False)))
         self.prefix_var.set(bool(cfg.get("prefix_duplicates", False)))
-        group = str(cfg.get("group_mode", _t("group_flat")))
+        group = _group_key_to_label(str(cfg.get("group_mode", "flat")))
         if group in self.fmt_combo["values"]:
             self.fmt_combo.set(group)
         self.fmt_var.set(str(cfg.get("date_fmt", "%Y-%m-%d")))
@@ -2103,7 +2417,7 @@ class PhotoOrganizerApp:
         self.date_folder_var.set(bool(cfg.get("date_folder_in_group", False)))
         self.save_log_var.set(bool(cfg.get("save_log", False)))
         try:
-            keep = int(cfg.get("log_keep_count", 30))
+            keep = int(cfg.get("log_keep_count", DEFAULT_LOG_KEEP))
         except (TypeError, ValueError):
             keep = 30
         self.log_keep_var.set(str(max(1, keep)))
@@ -2126,15 +2440,16 @@ class PhotoOrganizerApp:
             "copy_mode": self.copy_var.get(),
             "recursive": self.recursive_var.get(),
             "skip_existing_date_folders": self.skip_existing_var.get(),
+            "include_hidden_trash": self.hidden_trash_var.get(),
             "prefix_duplicates": self.prefix_var.get(),
-            "group_mode": self.fmt_combo.get(),
+            "group_mode": _group_label_to_key(self.fmt_combo.get()),
             "date_fmt": self.fmt_var.get(),
             "year_fmt": self.year_var.get(),
             "month_fmt": self.month_var.get(),
             "day_fmt": self.day_var.get(),
             "date_folder_in_group": self.date_folder_var.get(),
             "save_log": self.save_log_var.get(),
-            "log_keep_count": int(self.log_keep_var.get() or 30),
+            "log_keep_count": int(self.log_keep_var.get() or DEFAULT_LOG_KEEP),
             "language": CURRENT_LANG,
         }
 
@@ -2182,12 +2497,12 @@ class PhotoOrganizerApp:
         return out[-10:]
 
     def _record_path(self, path: str, history: list) -> list:
-        """把一条路径记入历史（最新在前，去重，最多 10 条）。"""
+        """把一条路径记入历史（最新在前，去重，最多 MAX_HISTORY 条）。"""
         path = path.strip()
         if not path:
             return history
         out = [path] + [h for h in history if h != path]
-        return out[:10]
+        return out[:MAX_HISTORY]
 
     def on_clear_paths(self, side: str):
         """清除界面记住的源或目标文件夹路径记录（不弹窗确认，并同步清空当前输入框内容）。"""
@@ -2227,7 +2542,7 @@ class PhotoOrganizerApp:
         win.title(_t("win_formats"))
         win.transient(self.root)
         win.grab_set()
-        win.geometry("440x400")
+        win.geometry(FMT_DIALOG_GEOM)
         win.minsize(400, 340)
 
         cur = set(self._photo_exts)  # 本次运行内已勾选集合（默认基础 9 种）
@@ -2237,7 +2552,18 @@ class PhotoOrganizerApp:
         canvas = tk.Canvas(win, highlightthickness=0, height=190)
         sb = ttk.Scrollbar(win, orient=tk.VERTICAL, command=canvas.yview)
         inner = ttk.Frame(canvas)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        def _update_scrollregion(_e=None):
+            """滚动区域取内容与视口的较大值，内容不满屏时滚动条不可滚动、无空白。"""
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return
+            view_w = canvas.winfo_width()
+            view_h = canvas.winfo_height()
+            canvas.configure(scrollregion=(0, 0, max(bbox[2], view_w), max(bbox[3], view_h)))
+
+        inner.bind("<Configure>", _update_scrollregion)
+        canvas.bind("<Configure>", _update_scrollregion)
         canvas.create_window((0, 0), window=inner, anchor="nw")
         canvas.configure(yscrollcommand=sb.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -2252,14 +2578,14 @@ class PhotoOrganizerApp:
         # 格式列表：3 列网格，避免单列过长
         grid_frame = ttk.Frame(inner)
         grid_frame.pack(fill=tk.X, anchor="w", padx=(4, 4))
-        for col in range(3):
+        for col in range(FMT_GRID_COLS):
             grid_frame.columnconfigure(col, weight=1)
 
         check_vars: dict[str, tk.BooleanVar] = {}
         for i, ext in enumerate(sorted(candidates)):
             var = tk.BooleanVar(value=ext in cur)
             ttk.Checkbutton(grid_frame, text=ext, variable=var, padding=(12, 1)) \
-                .grid(row=i // 3, column=i % 3, sticky="w", padx=8)
+                .grid(row=i // FMT_GRID_COLS, column=i % FMT_GRID_COLS, sticky="w", padx=8)
             check_vars[ext] = var
 
         # 自定义添加行（紧随列表下方）
@@ -2283,11 +2609,11 @@ class PhotoOrganizerApp:
                 var = tk.BooleanVar(value=True)
                 i = len(check_vars)
                 ttk.Checkbutton(grid_frame, text=ext, variable=var, padding=(12, 1)) \
-                    .grid(row=i // 3, column=i % 3, sticky="w", padx=8)
+                    .grid(row=i // FMT_GRID_COLS, column=i % FMT_GRID_COLS, sticky="w", padx=8)
                 check_vars[ext] = var
             entry_var.set("")
             inner.update_idletasks()
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            _update_scrollregion()
         entry.bind("<Return>", lambda e: add_custom())
         ttk.Button(add_row, text=_t("btn_add"), command=add_custom).pack(side=tk.LEFT, padx=4)
 
@@ -2300,8 +2626,11 @@ class PhotoOrganizerApp:
             if not selected:
                 messagebox.showwarning(_t("title_info"), _t("msg_min_format"), parent=win)
                 return
-            self._photo_exts = selected  # 本次运行生效，并写入配置文件持久化
-            self._save_current_config()
+            self._photo_exts = selected  # 本次运行生效
+            # 二审 M2：仅持久化 photo_exts，避免格式弹窗确认连带覆盖其它界面状态（其余状态在点击开始整理时统一保存）
+            _cfg = load_config()
+            _cfg["photo_exts"] = sorted(selected)
+            save_config(_cfg)
             win.grab_release()
             win.destroy()
 
@@ -2360,9 +2689,9 @@ class PhotoOrganizerApp:
         widget.tag_add("sel", "1.0", tk.END)
         widget.configure(state=tk.DISABLED)
 
-    def show_fmt_help(self):
-        """弹出日期格式说明窗口，供用户照着填写（已打开则不重复创建）。"""
-        exist = getattr(self, "_fmt_help_win", None)
+    def _show_help_window(self, win_attr: str, title_key: str, geom: str, minsize: tuple, text_key: str):
+        """公共帮助窗口（二审 STYLE2）：单例窗口检查 → Toplevel → ScrolledText 展示 → 右键菜单 → 关闭回调。"""
+        exist = getattr(self, win_attr, None)
         if exist is not None:
             try:
                 if exist.winfo_exists():
@@ -2373,13 +2702,21 @@ class PhotoOrganizerApp:
                 pass
 
         win = tk.Toplevel(self.root)
-        self._fmt_help_win = win
-        win.title(_t("win_fmt_help"))
+        setattr(self, win_attr, win)
+        win.title(_t(title_key))
         win.transient(self.root)
-        win.geometry("460x420")
-        win.minsize(420, 360)
+        win.geometry(geom)
+        win.minsize(*minsize)
 
-        text = _t("fmt_help_body")
+        text = _t(text_key)
+
+        def _close():
+            setattr(self, win_attr, None)
+            if win.winfo_exists():
+                win.destroy()
+        # 按钮先 pack、固定在底部，文本区后 pack 吃掉剩余空间（避免文本长时按钮被挤出可视区）
+        ttk.Button(win, text=_t("btn_got_it"), command=_close).pack(side=tk.BOTTOM, pady=8)
+
         body = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Consolas", 11),
                                          padx=14, pady=10, relief=tk.FLAT, state=tk.DISABLED)
         body.pack(fill=tk.BOTH, expand=True)
@@ -2388,47 +2725,19 @@ class PhotoOrganizerApp:
         body.configure(state=tk.DISABLED)
         self._bind_copy_menu(body)  # 右键复制 / 全选
 
-        def _close():
-            self._fmt_help_win = None
-            if win.winfo_exists():
-                win.destroy()
-        ttk.Button(win, text=_t("btn_got_it"), command=_close).pack(pady=8)
         win.protocol("WM_DELETE_WINDOW", _close)
+
+    def show_fmt_help(self):
+        """弹出日期格式说明窗口；同时把说明正文写入日志窗口一份（开头带 [信息] 提示行）。"""
+        self._show_help_window("_fmt_help_win", "win_fmt_help",
+                               FMT_HELP_GEOM, (420, 360), "fmt_help_body")
+        self.log(f"{_t('log_fmt_help_pre')}\n{_t('fmt_help_body')}")
 
     def show_help(self):
-        """弹出命令行用法说明窗口，供用户复制（已打开则不重复创建）。"""
-        exist = getattr(self, "_help_win", None)
-        if exist is not None:
-            try:
-                if exist.winfo_exists():
-                    exist.lift()
-                    exist.focus_set()
-                    return
-            except Exception:
-                pass
-
-        win = tk.Toplevel(self.root)
-        self._help_win = win
-        win.title(_t("btn_help"))
-        win.transient(self.root)
-        win.geometry("560x500")
-        win.minsize(480, 380)
-
-        text = _t("help_body")
-        body = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Consolas", 11),
-                                         padx=14, pady=10, relief=tk.FLAT, state=tk.DISABLED)
-        body.pack(fill=tk.BOTH, expand=True)
-        body.configure(state=tk.NORMAL)
-        body.insert(tk.END, text)
-        body.configure(state=tk.DISABLED)
-        self._bind_copy_menu(body)  # 右键复制 / 全选
-
-        def _close():
-            self._help_win = None
-            if win.winfo_exists():
-                win.destroy()
-        ttk.Button(win, text=_t("btn_got_it"), command=_close).pack(pady=8)
-        win.protocol("WM_DELETE_WINDOW", _close)
+        """弹出命令行用法说明窗口；同时把说明正文写入日志窗口一份（开头带 [信息] 提示行）。"""
+        self._show_help_window("_help_win", "btn_help",
+                               HELP_GEOM, (480, 380), "help_body")
+        self.log(f"{_t('log_help_body_pre')}\n{_t('help_body')}")
 
     def on_fmt_change(self, event=None):
         """分组方式切换：单层格式 <-> 层级嵌套（年/月/日三层），并联动日期格式行显隐。"""
@@ -2510,6 +2819,7 @@ class PhotoOrganizerApp:
         self.log(f"{_t('line_src')}{source_dir}")
         self.log(f"{_t('line_dest')}{dest_dir}")
         self.log(f"{_t('line_video')}{_t('yes') if self.video_var.get() else _t('no')}{_t('line_mode_sep')}{_t('mode_dry') if dry_run else (_t('chk_copy_mode') if self.copy_var.get() else _t('mode_move'))}")
+        self.log(f"{_t('line_hidden_trash')}{_t('yes') if self.hidden_trash_var.get() else _t('no')}")
         self.log(f"{_t('line_recursive')}{_t('yes') if self.recursive_var.get() else _t('no')}{_t('line_conflict_sep')}{_t('conflict_prefix') if self.prefix_var.get() else _t('conflict_skip')}")
         if group:
             self.log(f"{_t('line_group')}{self.fmt_combo.get()}{_t('line_year_sep')}{year_fmt}{_t('line_month_sep')}{month_fmt}{_t('line_day_sep')}{day_fmt}"
@@ -2518,15 +2828,30 @@ class PhotoOrganizerApp:
             self.log(f"{_t('line_group_flat')}{fmt}")
         self.log("----------------------------------------")
 
+        # 二审 M1：主线程快照 Tk 变量，工作线程只读快照（避免跨线程读 Tk 变量）
+        snap = {
+            "include_video": self.video_var.get(),
+            "copy_mode": self.copy_var.get(),
+            "recursive": self.recursive_var.get(),
+            "prefix_duplicates": self.prefix_var.get(),
+            "date_folder_in_group": self.date_folder_var.get(),
+            "skip_existing": self.skip_existing_var.get(),
+            "include_hidden_trash": self.hidden_trash_var.get(),
+            "save_log": self.save_log_var.get(),
+            "log_keep": self.log_keep_var.get().strip(),
+            "group": self.fmt_combo.get(),
+            "photo_exts": set(self._photo_exts),
+        }
+
         t = threading.Thread(target=self.worker,
-                             args=(source_dir, dest_dir, fmt, group, year_fmt, month_fmt, day_fmt, dry_run),
+                             args=(source_dir, dest_dir, fmt, group, year_fmt, month_fmt, day_fmt, dry_run, snap),
                              daemon=True)
         t.start()
         self.root.after(100, self.poll)
 
     def worker(self, source_dir: str, dest_dir: str, fmt: str,
                group: str | None, year_fmt: str, month_fmt: str, day_fmt: str,
-               dry_run: bool):
+               dry_run: bool, snap: dict):
         lines: list = []
         actions: list = []
 
@@ -2534,40 +2859,49 @@ class PhotoOrganizerApp:
             self.log_q.put(msg)
             lines.append(msg)
 
-        stats = organize(source_dir, dest_dir, dry_run=dry_run,
-                 include_video=self.video_var.get(), log_func=_log,
-                 copy_mode=self.copy_var.get(), recursive=self.recursive_var.get(),
-                 prefix_duplicates=self.prefix_var.get(), date_fmt=fmt,
-                 group_levels=group, year_fmt=year_fmt,
-                 month_fmt=month_fmt, day_fmt=day_fmt,
-                 date_folder_in_group=self.date_folder_var.get(),
-                 skip_existing_date_folders=self.skip_existing_var.get(),
-                 photo_exts=self._photo_exts,
-                 actions=actions)
-        if self.save_log_var.get():
+        try:
+            stats = organize(source_dir, dest_dir, dry_run=dry_run,
+                     include_video=snap["include_video"], log_func=_log,
+                     copy_mode=snap["copy_mode"], recursive=snap["recursive"],
+                     prefix_duplicates=snap["prefix_duplicates"], date_fmt=fmt,
+                     group_levels=group, year_fmt=year_fmt,
+                     month_fmt=month_fmt, day_fmt=day_fmt,
+                     date_folder_in_group=snap["date_folder_in_group"],
+                     skip_existing_date_folders=snap["skip_existing"],
+                     include_hidden_trash=snap["include_hidden_trash"],
+                     photo_exts=snap["photo_exts"],
+                     actions=actions)
+            if snap["save_log"]:
+                try:
+                    keep = int(snap["log_keep"] or DEFAULT_LOG_KEEP)
+                except (TypeError, ValueError):
+                    keep = 30
+                meta = {
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "mode": _t("mode_dry") if dry_run else (_t("chk_copy_mode") if snap["copy_mode"] else _t("mode_move")),
+                    "src": source_dir,
+                    "dest": dest_dir,
+                    "recursive": _t("yes") if snap["recursive"] else _t("no"),
+                    "include_hidden_trash": _t("yes") if snap["include_hidden_trash"] else _t("no"),
+                    "conflict": _t("conflict_prefix") if snap["prefix_duplicates"] else _t("conflict_skip"),
+                    "group": snap["group"],
+                    "date_fmt": fmt,
+                    "keep": str(keep),
+                }
+                if stats:
+                    meta["stats"] = _stats_to_meta(stats)
+                try:
+                    log_path = write_organize_log(meta, lines, actions, keep)
+                    self.log_q.put(f"{_t('log_saved')}{log_path.name}")
+                except Exception as e:
+                    self.log_q.put(f"{_t('err_save_log')}{e}")
+        except Exception as e:
             try:
-                keep = int(self.log_keep_var.get() or 30)
-            except (TypeError, ValueError):
-                keep = 30
-            meta = {
-                _t("meta_time"): datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                _t("meta_mode"): _t("mode_dry") if dry_run else (_t("chk_copy_mode") if self.copy_var.get() else _t("mode_move")),
-                _t("meta_src"): source_dir,
-                _t("meta_dest"): dest_dir,
-                _t("chk_recursive"): _t("yes") if self.recursive_var.get() else _t("no"),
-                _t("meta_conflict"): _t("conflict_prefix") if self.prefix_var.get() else _t("conflict_skip"),
-                _t("meta_group"): self.fmt_combo.get(),
-                _t("meta_date_fmt"): fmt,
-                _t("meta_keep"): str(keep),
-            }
-            if stats:
-                meta["stats"] = _stats_to_meta(stats)
-            try:
-                log_path = write_organize_log(meta, lines, actions, keep)
-                self.log_q.put(f"{_t('log_saved')}{log_path.name}")
-            except Exception as e:
-                self.log_q.put(f"{_t('err_save_log')}{e}")
-        self.log_q.put(None)
+                self.log_q.put(f"{_t('err_worker_crash')}{e}")
+            except Exception:
+                pass
+        finally:
+            self.log_q.put(None)
 
     def poll(self):
         try:
@@ -2588,6 +2922,7 @@ class PhotoOrganizerApp:
 
 
 def main():
+    global tk, filedialog, messagebox, scrolledtext, ttk  # tkinter 延迟到 GUI 分支导入（import 时无副作用）
     import argparse
 
     parser = argparse.ArgumentParser(description=_t("prog_desc"))
@@ -2605,24 +2940,23 @@ def main():
     parser.add_argument("-r", "--recursive", action="store_true",
                         help=_t("arg_recursive"))
     parser.add_argument("--skip-existing-date-folders", dest="skip_existing_date_folders",
-                        action="store_true",
+                        action=argparse.BooleanOptionalAction, default=True,
                         help=_t("arg_skip_existing"))
-    parser.add_argument("--no-skip-existing-date-folders", dest="no_skip_existing_date_folders",
-                        action="store_true",
-                        help=_t("arg_no_skip_existing"))
     parser.add_argument("--prefix", action="store_true",
                         help=_t("arg_prefix"))
     parser.add_argument("--date-folder", dest="date_folder", action="store_true",
                         help=_t("arg_date_folder"))
     parser.add_argument("--no-video", action="store_true",
                         help=_t("arg_no_video"))
+    parser.add_argument("--include-hidden-trash", dest="include_hidden_trash",
+                        action="store_true", default=False,
+                        help=_t("arg_include_hidden_trash"))
     parser.add_argument("--lang", choices=["zh", "en"], default=None,
                         help=_t("arg_lang"))
-    parser.add_argument("--save-log", dest="save_log", action="store_true",
+    parser.add_argument("--save-log", dest="save_log",
+                        action=argparse.BooleanOptionalAction, default=False,
                         help=_t("arg_save_log"))
-    parser.add_argument("--no-save-log", dest="no_save_log", action="store_true",
-                        help=_t("arg_no_save_log"))
-    parser.add_argument("--log-keep", dest="log_keep", type=int, default=30,
+    parser.add_argument("--log-keep", dest="log_keep", type=int, default=DEFAULT_LOG_KEEP,
                         help=_t("arg_log_keep"))
     parser.add_argument("--reset-config", dest="reset_config", action="store_true",
                         help=_t("arg_reset_config"))
@@ -2655,6 +2989,10 @@ def main():
                         help=_t("arg_add_ext"))
     parser.add_argument("--remove-photo-ext", dest="remove_photo_exts", action="append", default=[],
                         help=_t("arg_remove_ext"))
+    parser.add_argument("--no-exif", dest="no_exif", action="store_true",
+                        help=_t("arg_no_exif"))
+    parser.add_argument("--yes", dest="yes", action="store_true",
+                        help=_t("arg_yes"))
     parser.add_argument("-g", "--gui", action="store_true",
                         help=_t("arg_gui"))
     args = parser.parse_args()
@@ -2715,10 +3053,12 @@ def main():
         if "error" in stats:
             print(stats["error"])
             return
-        print(f"还原完成: 移回 {stats['moved']} 个 | 删除副本 {stats['removed']} 个 | "
-              f"跳过 {stats['skipped']} 个 | 目标文件已不存在 {stats['missing']} 个")
+        print(_rollback_done_msg(stats))
         return
     if args.clear_logs:
+        if not args.yes:
+            print(_t("msg_need_yes"))
+            return
         d = get_logs_dir()
         try:
             targets = [p for p in d.iterdir() if p.suffix.lower() == ".jsonl"]
@@ -2738,6 +3078,9 @@ def main():
         print(f"{_t('log_cleared_pre')}{removed}{_t('log_cleared_post')}")
         return
     if args.clear_data:
+        if not args.yes:
+            print(_t("msg_need_yes"))
+            return
         stats = clear_all_data()
         for f in stats.get("files", []):
             if f.suffix.lower() == ".jsonl":
@@ -2773,6 +3116,8 @@ def main():
 
     # 双击无参数 → 图形界面；命令行带参数 → 命令行模式
     if args.gui or (args.source_dir is None and not args.dry_run):
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, scrolledtext, ttk
         root = tk.Tk()
         PhotoOrganizerApp(root)
         root.mainloop()
@@ -2792,15 +3137,17 @@ def main():
                  group_levels=args.group, year_fmt=args.year_format,
                  month_fmt=args.month_format, day_fmt=args.day_format,
                  date_folder_in_group=args.date_folder,
-                 skip_existing_date_folders=args.skip_existing_date_folders and not args.no_skip_existing_date_folders,
+                 skip_existing_date_folders=args.skip_existing_date_folders,
+                 include_hidden_trash=args.include_hidden_trash,
                  add_photo_exts=args.add_photo_exts,
                  remove_photo_exts=args.remove_photo_exts,
+                 no_exif=args.no_exif,
                  log_func=_log, actions=actions)
 
-        save_log = args.save_log  # CLI 默认不保存操作清单（与 GUI 默认不勾选一致）
+        save_log = args.save_log  # CLI 默认不保存操作清单（BooleanOptionalAction 支持 --no-save-log 显式关闭）
         if save_log:
             try:
-                keep = int(args.log_keep or 30)
+                keep = int(args.log_keep or DEFAULT_LOG_KEEP)
             except (TypeError, ValueError):
                 keep = 30
             meta = {
@@ -2809,6 +3156,7 @@ def main():
                 "src": args.source_dir or SOURCE_DIR,
                 "dest": args.dest_dir or DEST_DIR,
                 "recursive": _t("yes") if args.recursive else _t("no"),
+                "include_hidden_trash": _t("yes") if args.include_hidden_trash else _t("no"),
                 "conflict": _t("conflict_prefix") if args.prefix else _t("conflict_skip"),
                 "group": args.group or "",
                 "date_fmt": args.date_format or DATE_FMT,

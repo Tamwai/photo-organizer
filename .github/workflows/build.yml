@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: '要发布的 tag（如 v0.2.0），留空则仅构建不发布'
+        description: '要发布的 tag（如 v0.2.1），留空则仅构建不发布'
         required: false
-        default: 'v0.2.0'
+        default: 'v0.2.1'
 
 jobs:
   build:
@@ -37,7 +37,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pyinstaller pillow
+        run: pip install pyinstaller "pillow==12.3.0"
 
       - name: Install UPX (Windows)
         if: matrix.os == 'windows-latest'
@@ -55,21 +55,25 @@ jobs:
           tar -xf upx.tar.xz
           echo "UPX_DIR=$(ls -d upx-*/ | head -1)" >> $GITHUB_ENV
 
+      - name: Prepare release notes
+        run: |
+          awk '/^## \[/{c++} c==1{print} c==2{exit}' CHANGELOG.md > body.md
+
       - name: Build executable
         shell: bash
         run: |
-          VERSION=$(python - <<'EOF'
-          import re
-          src = open('photo_organizer.py', encoding='utf-8').read()
-          m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', src)
-          print(m.group(1))
-          EOF
-          )
+          VERSION=$(sed -n "s/.*__version__[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" photo_organizer.py | head -1)
           if [ -n "$UPX_DIR" ]; then
             pyinstaller --onefile --upx-dir "$UPX_DIR" --name "photo-organizer-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
           else
             pyinstaller --onefile --noupx --name "photo-organizer-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
           fi
+
+      - name: Package source archive (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p dist
+          git archive --format=zip --prefix="photo-organizer-src/" -o "dist/photo-organizer-src.zip" HEAD
 
       - name: Publish to Release
         uses: softprops/action-gh-release@v2
@@ -78,3 +82,5 @@ jobs:
           files: dist/*
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           generate_release_notes: false
+          overwrite: true
+          body_path: body.md
