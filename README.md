@@ -4,7 +4,7 @@
 
 ## 版本
 
-当前版本 **v0.2.1**。可用 `python photo_organizer.py --version` 查看。
+当前版本 **v0.3.0**。可用 `python photo_organizer.py --version` 查看。
 
 更新历史见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -148,6 +148,70 @@ pip install -r requirements.txt
 首次运行后界面设置会持久化到配置目录 `%APPDATA%\photo-organizer\config.json`（含源/目标文件夹、分组方式、日期格式、是否整理视频、是否包含隐藏/.trashed 文件、复制/移动模式、操作清单保留份数、界面语言等），无需每次重新设置；界面提供「恢复默认设置」一键还原，也可用 `--reset-config` 恢复默认。
 
 默认值细节：操作清单保留 `30` 份（`--log-keep 30`）；默认**不**保存操作清单（需 `--save-log` 显式开启）；日志彩色输出默认**开启**（`--mono` 关闭）；「跳过已有日期文件夹」默认**开启**（仅原地整理时生效，`--no-skip-existing-date-folders` 关闭）；「包含隐藏文件和 .trashed 文件」默认**不勾选**（需 GUI 勾选或 `--include-hidden-trash` 开启）。
+
+## MCP 接入
+
+photo-organizer 提供 MCP（Model Context Protocol）服务器，供 AI 客户端（如 Claude Desktop、支持 MCP 的编辑器/助手）安全地调用整理能力：预览整理计划、执行整理、查看与还原操作清单。既有 CLI 与 GUI 功能不受影响。
+
+### 安装
+
+```bash
+pip install photo-organizer-mcp
+```
+
+仓库内开发使用可执行 `pip install -e .`。
+
+### 客户端配置
+
+在客户端 MCP 配置（如 `claude_desktop_config.json` 的 `mcpServers` 字段）中添加：
+
+```json
+{
+  "mcpServers": {
+    "photo-organizer": {
+      "command": "photo-organizer-mcp",
+      "args": ["--allow", "C:/Users/你的用户名/Pictures", "--allow", "D:/照片库"],
+      "type": "stdio"
+    }
+  }
+}
+```
+
+`--allow` 可多次传入，声明允许访问的根目录；未传时依次回退到配置文件（见下）与默认 `~/Pictures`。
+
+### 工具
+
+| 工具 | 说明 |
+|---|---|
+| `preview_organize` | 预览整理计划（只读）：扫描源目录并计算归类目标，返回计划清单与确认令牌 |
+| `organize_photos` | 执行整理；默认模拟运行，实际移动/复制需传入匹配的确认令牌 |
+| `list_logs` | 列出最近的操作清单 |
+| `show_log` | 查看指定操作清单明细 |
+| `revert_changes` | 按操作清单还原一次整理（默认预览，不实际还原） |
+| `get_config` | 返回当前生效的访问白名单、单次最大文件数与版本 |
+
+### 安全机制
+
+- **目录白名单**：源/目标路径必须位于白名单根目录之下，越界返回 `PATH_NOT_ALLOWED`；目标目录必须已存在，禁止自动创建
+- **不支持原地整理**：MCP 模式要求 `source` 与 `dest` 为不同目录（`source == dest` 或其子目录时返回 `DEST_IN_SOURCE`）；原地整理请使用 CLI 或 GUI
+- **确认令牌（confirm_token）**：`preview_organize` 与 `organize_photos` 共用同一份 `core.organize(dry_run=True)` 生成的计划（含重命名文件名），令牌基于该计划生成，确保预览与执行完全一致
+- **默认模拟运行**：破坏性操作默认 `dry_run=true`，仅统计不落盘
+- **固定错误码**：统一返回 `SRC_MISSING` / `PATH_NOT_ALLOWED` / `DEST_MISSING` / `DEST_IN_SOURCE` / `CONFIRM_TOKEN_MISMATCH` / `MAX_FILES_EXCEEDED` / `INVALID_PARAM` / `NOT_FOUND` / `IO_ERROR`
+- **无网络外联**：服务器不发起任何网络请求
+
+### 可选配置
+
+配置文件位于 `%APPDATA%\photo-organizer\mcp_config.json`（macOS/Linux 为对应平台配置目录），运行时按修改时间热加载，无需重启：
+
+```json
+{
+  "allowed_roots": ["C:/Users/你的用户名/Pictures", "D:/照片库"],
+  "max_files_per_run": 5000
+}
+```
+
+- `allowed_roots`：访问白名单根目录列表；`--allow` 启动参数优先于此配置
+- `max_files_per_run`：单次整理最大文件数上限（默认 5000），超过返回 `MAX_FILES_EXCEEDED`
 
 ## 许可证
 

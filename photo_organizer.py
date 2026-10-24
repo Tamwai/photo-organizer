@@ -25,7 +25,7 @@
 """
 import sys
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 import os
 import re
@@ -64,852 +64,18 @@ VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", "
 INCLUDE_VIDEO = True  # 是否同时整理视频
 
 
-# ========== 配置文件（按各平台规范目录存放） ==========
-APP_NAME = "photo-organizer"
 
 
-def get_config_dir() -> Path:
-    """返回平台规范的配置目录：Windows %APPDATA% / macOS Application Support / Linux XDG .config。"""
-    if sys.platform == "win32":
-        base = Path(os.getenv("APPDATA", str(Path.home() / "AppData/Roaming")))
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library/Application Support"
-    else:
-        base = Path(os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config")))
-    return base / APP_NAME
-
-
-def ensure_config_dir() -> Path:
-    """确保配置目录存在（写入类操作前调用；读取类操作不创建目录，避免 import 副作用）。"""
-    d = get_config_dir()
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    return d
-
-
-def get_config_file() -> Path:
-    return get_config_dir() / "config.json"
-
-
-def load_config() -> dict:
-    """读取配置文件；缺失或损坏时返回空字典（按默认值启动）。"""
-    try:
-        with open(get_config_file(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {}
-
-
-def save_config(cfg: dict) -> bool:
-    """保存配置到平台规范目录（写入前确保目录存在）。"""
-    try:
-        ensure_config_dir()
-        with open(get_config_file(), "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
-
-
-def reset_config() -> bool:
-    """删除配置文件（恢复默认设置）。"""
-    try:
-        p = get_config_file()
-        if p.exists():
-            p.unlink()
-        return True
-    except Exception:
-        return False
-
-
-def clear_all_data() -> dict:
-    """一键清理：删除配置文件与全部操作清单（跨平台，基于各平台规范配置目录）。
-
-    返回统计: {"config": bool, "logs": n, "files": [被删除的文件路径]}
-    （config=是否删除了配置文件，logs=删除的清单文件数，files=逐条删除的文件列表）
-    """
-    result = {"config": False, "logs": 0, "files": []}
-    try:
-        p = get_config_file()
-        if p.exists():
-            p.unlink()
-            result["config"] = True
-            result["files"].append(p)
-    except OSError:
-        pass
-    try:
-        d = get_config_dir() / "logs"
-        if d.exists():
-            n = 0
-            for f in d.iterdir():
-                if f.is_file():
-                    try:
-                        f.unlink()
-                        n += 1
-                        result["files"].append(f)
-                    except OSError:
-                        pass
-            try:
-                d.rmdir()  # 清空后移除空目录本身
-            except OSError:
-                pass
-            result["logs"] = n
-    except OSError:
-        pass
-    return result
-
-
-# 文件名中的日期模式，支持多种写法：
-#   IMG_20260806_144736.jpg / Screenshot_2026-08-09-05-03-57.jpg
-#   2026.08.06.jpg / 2026 08 06.jpg / 20260806.jpg / VID_2026-08-06.mp4
-# 分隔符：- _ . 空格（可混用），也可无分隔符（8 位连续数字）
-NAME_DATE_PATTERNS = [
-    re.compile(r"(?<!\d)(\d{4})\s*[-_.]?\s*(\d{2})\s*[-_.]?\s*(\d{2})(?!\d)"),
-]
-# Unix 时间戳模式：13 位毫秒（mmexport1785419041663 等） / 10 位秒（1785419041 等）
-TS_PATTERNS = [
-    re.compile(r"(?<!\d)(\d{13})(?!\d)"),
-    re.compile(r"(?<!\d)(\d{10})(?!\d)"),
-]
-# 合理年份范围（照片/视频拍摄时间不会超出）
-MIN_YEAR, MAX_YEAR = 1970, 2099
-# ============================
-# 布局与数量常量（二审 STYLE1：消除魔法数字）
-FMT_DIALOG_GEOM = "440x400"
-FMT_DIALOG_MINSIZE = (400, 340)
-FMT_HELP_GEOM = "460x420"
-FMT_HELP_MINSIZE = (420, 360)
-HELP_GEOM = "560x500"
-HELP_MINSIZE = (480, 380)
-DEFAULT_LOG_KEEP = 30
-MAX_HISTORY = 10
-FMT_GRID_COLS = 3  # 格式弹窗扩展名网格列数
-# 文件名防御：控制字符（二审 SEC3）
-_CTRL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
-# ============================
-
-
-def get_exif_dt(filepath: str) -> datetime | None:
-    """读取 EXIF 原始拍摄时间，失败或无 PIL 返回 None"""
-    if not HAS_PIL:
-        return None
-    try:
-        with Image.open(filepath) as img:
-            exif = img.getexif()
-            if exif:
-                # 顶层 IFD0
-                for tag_id, value in exif.items():
-                    tag_name = TAGS.get(tag_id, "")
-                    if tag_name == "DateTimeOriginal":
-                        return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-                # Exif 子 IFD（0x8769），DateTimeOriginal 通常存放在这里
-                try:
-                    sub = exif.get_ifd(0x8769)
-                except Exception:
-                    sub = {}
-                for tag_id, value in sub.items():
-                    tag_name = TAGS.get(tag_id, "")
-                    if tag_name == "DateTimeOriginal":
-                        return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-    except Exception:
-        pass
-    return None
-
-
-def get_exif_date(filepath: str, date_fmt: str = DATE_FMT) -> str | None:
-    """读取 EXIF 原始拍摄日期（字符串格式），失败或无 PIL 返回 None"""
-    dt = get_exif_dt(filepath)
-    return dt.strftime(date_fmt) if dt else None
-
-
-def get_name_dt(filename: str) -> datetime | None:
-    """从文件名中解析日期，失败返回 None。
-    判定顺序：1) 明确的日期格式（含年月日，年份校验合理范围）2) Unix 时间戳
-    """
-    # 1) 明确日期格式：找文件名中第一个合法（年 1970-2099）的 YYYYMMDD
-    for pat in NAME_DATE_PATTERNS:
-        for m in pat.finditer(filename):
-            try:
-                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                if not (MIN_YEAR <= y <= MAX_YEAR):
-                    continue
-                return datetime(y, mo, d)
-            except ValueError:
-                continue
-    # 2) Unix 时间戳（mmexport1785419041663 / wx_camera_ 等）
-    for pat in TS_PATTERNS:
-        m = pat.search(filename)
-        if m:
-            try:
-                ts = int(m.group(1))
-                if ts >= 10**12:  # 13 位毫秒
-                    ts //= 1000
-                elif not filename.startswith(("mmexport", "wx_camera_")):
-                    # 10 位秒级时间戳：仅接受已知拍摄应用前缀，避免普通数字串误判（二审 S2）
-                    continue
-                dt = datetime.fromtimestamp(ts)
-                # 合理性收紧：仅接受 2000-01-01 至当前时间之间（二审 S2：避免把普通数字串误判为拍摄时间）
-                if datetime(2000, 1, 1) <= dt <= datetime.now():
-                    return dt
-            except (ValueError, OSError, OverflowError):
-                continue
-    return None
-
-
-def get_name_date(filename: str, date_fmt: str = DATE_FMT) -> str | None:
-    """从文件名中解析日期（字符串格式），失败返回 None"""
-    dt = get_name_dt(filename)
-    return dt.strftime(date_fmt) if dt else None
-
-
-def get_file_dt(filepath: str) -> datetime | None:
-    """获取文件日期对象：优先 EXIF，其次文件名日期，最后取文件时间。"""
-    dt = get_exif_dt(filepath)
-    if dt:
-        return dt
-    return get_file_dt_noexif(filepath)
-
-
-def get_file_dt_noexif(filepath: str) -> datetime | None:
-    """跳过 EXIF 的文件日期：文件名日期优先，其次文件时间（二审 PERF1 供 --no-exif 使用）。
-
-    平台差异：Windows 取「修改时间」与「创建时间（st_ctime 近似）」中较早者；
-    Linux/macOS 的 st_ctime 为元数据变更时间而非创建时间，仅取修改时间 st_mtime。
-    """
-    dt = get_name_dt(Path(filepath).name)
-    if dt:
-        return dt
-    stat = os.stat(filepath)
-    if os.name == "nt":
-        earliest = min(stat.st_mtime, stat.st_ctime)
-    else:
-        earliest = stat.st_mtime
-    return datetime.fromtimestamp(earliest)
-
-
-def get_file_date(filepath: str, date_fmt: str = DATE_FMT) -> str:
-    """获取文件日期（字符串格式）：优先 EXIF，其次文件名日期，最后取文件时间（Windows 含创建时间）"""
-    dt = get_file_dt(filepath)
-    return dt.strftime(date_fmt) if dt else ""
-
-
-def _sanitize_name(name: str) -> str:
-    """过滤文件名中的控制字符（防御性清洗，正常文件名不含；二审 SEC3）。"""
-    return _CTRL_CHARS.sub("_", name)
-
-
-def _clamp_log_keep(raw) -> int:
-    """安全解析操作清单保留份数（非法/越界回退默认值；二审 M1 用于主线程快照）。"""
-    try:
-        n = int(str(raw).strip() or DEFAULT_LOG_KEEP)
-    except (TypeError, ValueError):
-        n = DEFAULT_LOG_KEEP
-    return max(1, min(n, 999))
-
-
-def _is_trashed_file(name: str) -> bool:
-    """.trashed 为 Android 回收站文件（文件名以 .trashed- 开头），优先于隐藏判定。"""
-    return name.lower().startswith(".trashed-")
-
-
-def _is_hidden_file(path: Path) -> bool:
-    """跨平台隐藏判定：Unix 点开头文件名，或 Windows 隐藏属性（FILE_ATTRIBUTE_HIDDEN）。"""
-    if path.name.startswith("."):
-        return True
-    if os.name == "nt":
-        try:
-            return bool(getattr(path.stat(), "st_file_attributes", 0) & 0x2)
-        except OSError:
-            return False
-    return False
-
-
-def _tag_pad(text: str, width: int = 12) -> str:
-    """标签列定宽补空格：按显示宽度对齐（中文 2 列、英文 1 列），使文件名统一列开始。"""
-    disp = sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
-    return text + " " * max(0, width - disp)
-
-
-def collect_files(source: Path, dest_root: Path, supported: set, recursive: bool):
-    """收集源文件夹下待处理的照片/视频文件。
-    - recursive: True 时递归扫描所有子文件夹，并排除目标文件夹（防止把目标扫进来）
-    - 返回文件路径列表（递归时保留相对路径用于日志）
-    """
-    if not recursive:
-        return [f for f in source.iterdir()
-                if f.is_file() and not f.is_symlink() and f.suffix.lower() in supported]
-    files = []
-    dest_resolved = dest_root.resolve()
-    for root, dirs, names in os.walk(source):
-        root_path = Path(root)
-        # 目标文件夹在源目录内时，剪掉该分支（其下所有子目录一并排除），避免把已归类文件当源文件
-        dirs[:] = [d for d in dirs if (root_path / d).resolve() != dest_resolved]
-        for name in names:
-            p = root_path / name
-            if p.is_file() and not p.is_symlink() and p.suffix.lower() in supported:
-                files.append(p)
-    return files
-
-
-def _safe_transfer(src: Path, dest: Path, copy_mode: bool) -> None:
-    """原子传输：先写 .photo-org-tmp 临时文件，完成后 os.replace 原子改名。
-    - 复制模式：copy2 到 dest.photo-org-tmp → replace
-    - 移动模式同盘：shutil.move（os.rename 本身原子）
-    - 移动模式跨盘：copy2 到 dest.photo-org-tmp → replace → 删源
-    失败时清理本次 .photo-org-tmp 残留，不留半成品。
-    """
-    tmp = None
-    try:
-        if copy_mode:
-            tmp = dest.with_name(dest.name + ".photo-org-tmp")
-            shutil.copy2(str(src), str(tmp))
-            os.replace(tmp, dest)
-        else:
-            if os.stat(src).st_dev == os.stat(dest.parent).st_dev:
-                shutil.move(str(src), str(dest))
-            else:
-                tmp = dest.with_name(dest.name + ".photo-org-tmp")
-                shutil.copy2(str(src), str(tmp))
-                os.replace(tmp, dest)
-                # 跨盘移动：目标副本已原子就位，源删除失败时抛出明确错误（目标文件仍完整可用）
-                try:
-                    src.unlink()
-                except OSError as e:
-                    raise OSError(f"{_t('err_move_src_rm')}{src} ({e})") from e
-    except Exception:
-        if tmp is not None:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
-        raise
-
-
-def _cleanup_parts(dest_root: Path) -> list:
-    """扫描目标目录下残留的 .photo-org-tmp 半成品文件（本脚本专属后缀），返回文件列表（不删除）。
-
-    盘根保护：目标目录是文件系统根（如 D:/）时不做全盘递归扫描，直接返回空列表，
-    避免 rglob 全盘遍历造成长时间卡顿。
-    """
-    if not dest_root.exists():
-        return []
-    if dest_root.resolve() == Path(dest_root.anchor).resolve():
-        return []
-    try:
-        return [p for p in dest_root.rglob("*.photo-org-tmp")]
-    except OSError:
-        return []
-
-
-def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
-             include_video: bool = INCLUDE_VIDEO, log_func=print,
-             copy_mode: bool = False, recursive: bool = False,
-             prefix_duplicates: bool = False, date_fmt: str = DATE_FMT,
-             group_levels: str | None = None,
-             year_fmt: str = "%Y", month_fmt: str = "%m", day_fmt: str = "%d",
-             date_folder_in_group: bool = False,
-             skip_existing_date_folders: bool = True,
-             photo_exts: set | None = None,
-             add_photo_exts: set | list | None = None,
-             remove_photo_exts: set | list | None = None,
-             no_exif: bool = False,
-             include_hidden_trash: bool = False,
-             actions: list | None = None):
-    """整理源文件夹中的照片/视频到目标文件夹的日期子文件夹。
-    - source_dir: 源文件夹（从中读取照片）
-    - dest_dir: 目标文件夹（照片按日期归类到此处）
-    - dry_run: 模拟运行，只预览不移动
-    - include_video: 是否同时整理视频
-    - log_func: 日志回调（默认 print；GUI 可传入文本队列）
-    - copy_mode: True 时复制文件到日期文件夹（原文件保留）；默认 False 为移动
-    - recursive: True 时递归扫描源文件夹的所有子文件夹
-    - prefix_duplicates: True 时重名冲突自动加来源文件夹名前缀；默认跳过
-    - date_fmt: 单层日期文件夹格式（strftime），如 %Y 按年、%Y-%m 按月、%Y-%m-%d 按日
-    - group_levels: 层级分组模式，None/"Y" 仅年层、"YM" 年+月、"YMD" 年+月+日
-    - year_fmt / month_fmt / day_fmt: 层级分组时各层文件夹名格式（strftime），默认 %Y / %m / %d
-    - date_folder_in_group: 仅层级分组时生效。True 时在分组得到的最内层文件夹里再建一个日期文件夹（按 date_fmt），文件放日期文件夹；False 时文件直接放在最内层（年/月/日）文件夹里
-    - skip_existing_date_folders: 仅源=目标（原地整理）时生效；源目录下名字能匹配目标日期格式的子文件夹视为已整理，其中文件直接跳过（不判断文件日期）
-    - photo_exts: 图片格式集合（默认基础 9 种 BASE_PHOTO_EXTS；GUI 传入本次运行勾选结果）
-    - add_photo_exts: 额外增加的图片扩展名（CLI --add-photo-ext）
-    - remove_photo_exts: 临时排除的图片扩展名（CLI --remove-photo-ext）
-    - no_exif: True 时跳过 EXIF 读取（文件名日期优先，其次文件时间），大量文件时更快（二审 PERF1）
-    - include_hidden_trash: True 时也整理隐藏文件与 .trashed 文件（默认 False：跳过并打 [跳过][隐藏]/[跳过][Trash] 标签统计）
-    - actions: 可选列表；非模拟运行时，每次移动/复制成功追加
-      {"type": "move"/"copy", "src": 原路径, "dst": 目标路径, "ok": True}，供保存操作清单与还原使用
-    """
-    # 兼容命令行写法 year / year-month / year-month-day → Y / YM / YMD
-    group_levels = {"year": "Y", "year-month": "YM", "year-month-day": "YMD"}.get(group_levels, group_levels)
-    source = Path(source_dir)
-    if not source.exists():
-        log_func(f"{_t('err_src_missing')}{source_dir}")
-        return
-    if not source.is_dir():
-        log_func(f"{_t('err_src_not_dir')}{source_dir}")
-        return
-    dest_root = Path(dest_dir)
-    if dest_root.resolve() != Path(dest_root.anchor).resolve() and not dest_root.exists():
-        # 目标文件夹不存在时自动创建（盘根如 D:/ 除外，避免误建/不可操作）
-        try:
-            dest_root.mkdir(parents=True, exist_ok=True)
-            log_func(f"{_t('log_dest_created')}{dest_root}")
-        except OSError as e:
-            log_func(f"{_t('err_dest_create')}{dest_root} ({e})")
-            return
-    if not dest_root.exists():
-        log_func(f"{_t('err_dest_missing')}{dest_dir}")
-        return
-    if not dest_root.is_dir():
-        log_func(f"{_t('err_dest_not_dir')}{dest_dir}")
-        return
-
-    # 校验日期格式是否可用（如 %Y、%Y-%m 等 strftime 写法）
-    try:
-        datetime.now().strftime(date_fmt)
-        if group_levels:
-            datetime.now().strftime(year_fmt)
-            if "M" in group_levels:
-                datetime.now().strftime(month_fmt)
-            if "D" in group_levels:
-                datetime.now().strftime(day_fmt)
-    except Exception as e:
-        log_func(f"{_t('err_bad_fmt')}{e}")
-        return
-
-    # 层级分组模式白名单：仅接受 单层(None)/Y/YM/YMD（二审 M4）
-    if group_levels not in (None, "Y", "YM", "YMD"):
-        log_func(f"{_t('err_bad_group')}{group_levels}")
-        return
-
-    # 拒绝日期格式中混入时间指令（避免生成带时分秒的文件夹名，二审 M4）
-    _TIME_DIRECTIVES = ("%H", "%I", "%M", "%S", "%f", "%p", "%X", "%c")
-    for _label, _fmt in (("date_fmt", date_fmt),
-                         ("year_fmt", year_fmt),
-                         ("month_fmt", month_fmt),
-                         ("day_fmt", day_fmt)):
-        for _d in _TIME_DIRECTIVES:
-            if _d in _fmt:
-                log_func(f"{_t('err_fmt_time')}{_label} ({_fmt})")
-                return
-    if date_folder_in_group and not group_levels:
-        # 无分组层级时「分组时创建日期文件夹」无实际效果：提示并忽略（不改行为）
-        log_func(_t("warn_group_need"))
-
-    # 图片格式：默认基础 9 种，可叠加 CLI 加减
-    exts = set(photo_exts) if photo_exts else set(BASE_PHOTO_EXTS)
-    exts |= {str(e).strip().lower() for e in (add_photo_exts or []) if str(e).strip()}
-    exts -= {str(e).strip().lower() for e in (remove_photo_exts or []) if str(e).strip()}
-    supported = exts | (set(VIDEO_EXTS) if include_video else set())
-    photos = collect_files(source, dest_root, supported, recursive)
-
-    # Pillow 未加载时给出显式警告（EXIF 会静默失效，必须让用户看见）
-    if not HAS_PIL:
-        log_func(_t("warn_pil_pre") + (PIL_LOAD_ERROR or _t("unknown_err")) +
-                 _t("warn_pil_post"))
-
-    # 半成品清理已改为手动按钮/命令触发（避免目标盘根时全盘扫描卡顿），此处不再自动执行
-
-    if not photos:
-        log_func(_t("info_no_files") + (_t("incl_subfolders") if recursive else ""))
-        return
-
-    stats = {"moved": 0, "copied": 0, "skipped": 0, "failed": 0, "new_dirs": set(), "exif": 0, "fallback": 0,
-             "skip_dup": 0, "skip_nodate": 0, "skip_in_place": 0, "hidden": 0, "trash": 0, "by_ext": {}}
-    seen_names: dict[str, set] = {}  # date_str -> 已占用文件名集合（dry-run 也能量重名）
-
-    # 跳过已有日期文件夹：仅原地整理（源=目标）时生效。
-    # 源目录下名字可被目标日期格式解析的子文件夹视为已整理，其中文件不再判断日期直接跳过
-    classified_dirs: set[Path] = set()
-    if skip_existing_date_folders:
-        if not recursive:
-            log_func(_t("tag_tip") + _t("info_skip_need_recursive"))
-        elif source.resolve() != dest_root.resolve():
-            log_func(_t("tag_tip") + _t("info_skip_need_inplace"))
-        else:
-            try:
-                if group_levels:
-                    # 层级分组：逐层匹配 年/月/日（date_folder_in_group 时最内层再套 date_fmt）
-                    def _match_level(parent: Path, fmt: str) -> list[Path]:
-                        # 严格匹配：strptime 解析成功后须 strftime 回比一致，
-                        # 避免宽松格式（如 %Y）把任意 4 位数字目录误判为日期目录
-                        matched = []
-                        for d in parent.iterdir():
-                            if d.is_dir():
-                                try:
-                                    dt = datetime.strptime(d.name, fmt)
-                                    if dt.strftime(fmt) == d.name:
-                                        matched.append(d)
-                                except ValueError:
-                                    pass
-                        return matched
-                    year_dirs = _match_level(source, year_fmt)
-                    if "M" in group_levels:
-                        for yd in year_dirs:
-                            month_dirs = _match_level(yd, month_fmt)
-                            if "D" in group_levels:
-                                for md in month_dirs:
-                                    day_dirs = _match_level(md, day_fmt)
-                                    if date_folder_in_group:
-                                        classified_dirs.update(_match_level(md, date_fmt))
-                                    else:
-                                        classified_dirs.update(day_dirs)
-                            else:
-                                if date_folder_in_group:
-                                    classified_dirs.update(_match_level(yd, date_fmt))
-                                else:
-                                    classified_dirs.update(month_dirs)
-                    else:
-                        if date_folder_in_group:
-                            classified_dirs.update(_match_level(source, date_fmt))
-                        else:
-                            classified_dirs.update(year_dirs)
-                else:
-                    for d in source.iterdir():
-                        if d.is_dir():
-                            try:
-                                datetime.strptime(d.name, date_fmt)
-                                classified_dirs.add(d)
-                            except ValueError:
-                                pass
-                if classified_dirs:
-                    log_func(f"{_t('info_detect_pre')}{len(classified_dirs)}{_t('info_skip_dirs_post')}")
-            except OSError as e:
-                log_func(f"{_t('warn_scan_dirs')}{e}")
-
-    for p in photos:
-        try:
-            # 已有日期文件夹内的文件视为已整理，不判断日期直接跳过
-            if p.parent in classified_dirs:
-                stats["skipped"] += 1
-                stats["skip_in_place"] += 1
-                log_func(f"{_tag_pad(_t('tag_skip'))}{p.name}{_t('skip_in_place_post')}")
-                continue
-            # 隐藏/.trashed 文件：默认不处理并打 [跳过][隐藏]/[跳过][Trash] 标签；
-            # 勾选后正常归类。隐藏与 Trash 判定互不短路（可同时命中），视频额外补 [视频] 标签
-            is_trash = _is_trashed_file(p.name)
-            is_hidden = _is_hidden_file(p)
-            is_video = p.suffix.lower() in VIDEO_EXTS
-            if is_trash or is_hidden:
-                if not include_hidden_trash:
-                    stats["skipped"] += 1
-                    if is_trash:
-                        stats["trash"] += 1
-                    else:
-                        stats["hidden"] += 1
-                    skip_tags = ((_t("tag_hidden") if is_hidden else "")
-                                 + (_t("tag_trash") if is_trash else "")
-                                 + (_t("tag_video") if is_video else ""))
-                    log_func(f"{_tag_pad(_t('tag_skip') + skip_tags)}{p.name}")
-                    continue
-                if is_trash:
-                    stats["trash"] += 1
-                else:
-                    stats["hidden"] += 1
-            extra_tag = ((_t("tag_hidden") if is_hidden else "")
-                         + (_t("tag_trash") if is_trash else "")
-                         + (_t("tag_video") if is_video else ""))
-            ext = p.suffix.lower()
-            ext_stat = stats["by_ext"].setdefault(ext, {"total": 0, "exif": 0, "fallback": 0})
-            ext_stat["total"] += 1
-            if no_exif:
-                # --no-exif：跳过 EXIF 读取，文件名日期优先，其次文件时间（二审 PERF1）
-                dt = get_file_dt_noexif(str(p))
-                stats["fallback"] += 1
-                ext_stat["fallback"] += 1
-            else:
-                dt = get_exif_dt(str(p))
-                if dt:
-                    stats["exif"] += 1
-                    ext_stat["exif"] += 1
-                else:
-                    dt = get_file_dt(str(p))
-                    stats["fallback"] += 1
-                    ext_stat["fallback"] += 1
-
-            if dt is None:
-                stats["skipped"] += 1
-                stats["skip_nodate"] += 1
-                log_func(f"{_tag_pad(_t('tag_skip'))}{p.name}{_t('skip_no_date_post')}")
-                continue
-
-            # 目标相对路径：单层格式 or 年/月/日层级嵌套（分组时可再叠一层日期文件夹）
-            if group_levels:
-                parts = [dt.strftime(year_fmt)]
-                if "M" in group_levels:
-                    parts.append(dt.strftime(month_fmt))
-                if "D" in group_levels:
-                    parts.append(dt.strftime(day_fmt))
-                if date_folder_in_group:
-                    parts.append(dt.strftime(date_fmt))
-                date_str = "/".join(parts)
-            else:
-                date_str = dt.strftime(date_fmt)
-
-            dest_dir_path = dest_root / date_str
-            is_new_dir = not dest_dir_path.exists()
-            if not dry_run:
-                dest_dir_path.mkdir(parents=True, exist_ok=True)
-            if is_new_dir:
-                stats["new_dirs"].add(date_str)
-
-            # 显示用相对路径（递归时带子文件夹层级）
-            try:
-                rel = p.relative_to(source).as_posix()
-            except ValueError:
-                rel = p.name
-
-            dest_path = dest_dir_path / p.name
-            occupied = seen_names.setdefault(date_str, set())
-            if dest_path.exists() or p.name in occupied:
-                if not prefix_duplicates:
-                    stats["skipped"] += 1
-                    stats["skip_dup"] += 1
-                    log_func(f"{_tag_pad(_t('tag_skip'))}{rel}{_t('skip_exists_post')} -> {date_str}/")
-                else:
-                    # 自动加来源文件夹名前缀（顶层文件即源目录名），仍冲突则追加序号
-                    prefix = p.parent.name
-                    base, ext = os.path.splitext(p.name)
-                    # 防御：剔除路径中不可见的控制字符（正常文件名不含，防御异常输入；二审 SEC3）
-                    new_name = _sanitize_name(f"{prefix}_{p.name}")
-                    dest_path = dest_dir_path / new_name
-                    counter = 1
-                    while dest_path.exists() or new_name in occupied:
-                        new_name = _sanitize_name(f"{prefix}_{base}_{counter}{ext}")
-                        dest_path = dest_dir_path / new_name
-                        counter += 1
-                    occupied.add(new_name)
-                    if dry_run:
-                        stats["copied" if copy_mode else "moved"] += 1
-                        log_func(f"{_tag_pad(_t('tag_sim') + _t('tag_rename') + extra_tag)}{rel} -> {date_str}/{new_name}")
-                        if actions is not None:
-                            actions.append({"type": "plan_copy" if copy_mode else "plan_move",
-                                            "src": str(p), "dst": str(dest_path), "ok": True})
-                    else:
-                        _safe_transfer(p, dest_path, copy_mode)
-                        stats["copied" if copy_mode else "moved"] += 1
-                        log_func(f"{_tag_pad(_t('tag_rename') + extra_tag)}{rel} -> {date_str}/{new_name}")
-                        if actions is not None:
-                            actions.append({"type": "copy" if copy_mode else "move",
-                                            "src": str(p), "dst": str(dest_path), "ok": True})
-            elif dry_run:
-                stats["copied" if copy_mode else "moved"] += 1
-                occupied.add(p.name)
-                log_func(f"{_tag_pad(_t('tag_sim') + (_t('tag_copy') if copy_mode else _t('tag_move')) + extra_tag)}{rel} -> {date_str}/")
-                if actions is not None:
-                    actions.append({"type": "plan_copy" if copy_mode else "plan_move",
-                                    "src": str(p), "dst": str(dest_path), "ok": True})
-            else:
-                _safe_transfer(p, dest_path, copy_mode)
-                stats["copied" if copy_mode else "moved"] += 1
-                occupied.add(p.name)
-                log_func(f"{_tag_pad((_t('tag_copy') if copy_mode else _t('tag_move')) + extra_tag)}{rel} -> {date_str}/")
-                if actions is not None:
-                    actions.append({"type": "copy" if copy_mode else "move",
-                                    "src": str(p), "dst": str(dest_path), "ok": True})
-        except Exception as e:
-            stats["failed"] += 1
-            log_func(f"{_tag_pad(_t('tag_error'))}{p.name} ({e})")
-
-    mode = _t("mode_dry") if dry_run else (_t("mode_copy_done") if copy_mode else _t("mode_org_done"))
-    log_func(f"\n===== {mode} =====")
-    log_func(f"{_t('sum_move')}{stats['moved']}{_t('sum_copied_sep')}{stats['copied']}{_t('sum_skipped_sep')}{stats['skipped']}{_t('sum_failed_sep')}{stats['failed']}{_t('unit_zhang')}")
-    log_func(f"{_t('sum_new_dirs')}{len(stats['new_dirs'])}{_t('unit_ge')}")
-    if stats["hidden"] or stats["trash"]:
-        log_func(f"{_t('sum_hidden_pre')}{stats['hidden']}{_t('sum_trash_sep')}{stats['trash']}{_t('unit_ge')}")
-    log_func(f"{_t('sum_exif')}{stats['exif']}{_t('sum_fallback_sep')}{stats['fallback']}{_t('unit_zhang')}")
-
-    # 图片/视频大类统计
-    img_exif = img_fb = vid_exif = vid_fb = 0
-    for ext, c in stats["by_ext"].items():
-        if ext in VIDEO_EXTS:
-            vid_exif += c["exif"]
-            vid_fb += c["fallback"]
-        else:
-            img_exif += c["exif"]
-            img_fb += c["fallback"]
-    log_func(_t("detail_title"))
-    log_func(f"{_t('detail_imgs_pre')}{img_exif + img_fb}{_t('detail_exif_sep')}{img_exif}{_t('detail_fallback_sep')}{img_fb})")
-    log_func(f"{_t('detail_videos_pre')}{vid_exif + vid_fb}{_t('detail_exif_sep')}{vid_exif}{_t('detail_fallback_sep')}{vid_fb})")
-    # 按扩展名展开
-    log_func(_t("detail_by_ext"))
-    for ext, c in sorted(stats["by_ext"].items()):
-        log_func(f"  {ext}: {c['total']}{_t('detail_exif_sep')}{c['exif']}{_t('detail_fallback_sep')}{c['fallback']})")
-    # 跳过原因细分
-    if stats["skip_in_place"] or stats["skip_dup"] or stats["skip_nodate"] or stats["hidden"] or stats["trash"]:
-        log_func(f"{_t('detail_skip_pre')}{stats['skip_in_place']}{_t('detail_skip_dup_sep')}{stats['skip_dup']}{_t('detail_skip_nodate_sep')}{stats['skip_nodate']}{_t('detail_skip_hidden_sep')}{stats['hidden']}{_t('detail_skip_trash_sep')}{stats['trash']}{_t('unit_zhang')}")
-    return stats
-
-
-# ========== 日志保存与还原 ==========
-def get_logs_dir() -> Path:
-    """日志目录：配置目录下的 logs/。"""
-    d = get_config_dir() / "logs"
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    return d
-
-
-def list_logs() -> list:
-    """列出 logs 目录下已保存的操作清单（.jsonl），按修改时间倒序。"""
-    d = get_logs_dir()
-    try:
-        logs = [p for p in d.iterdir() if p.suffix.lower() == ".jsonl"]
-    except OSError:
-        return []
-    logs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return logs
-
-
-def write_organize_log(meta: dict, lines: list, actions: list, keep: int) -> Path:
-    """把一次整理会话的操作清单写成 .jsonl（首行为会话元信息，其余为动作清单），并清理超出保留份数的旧清单。
-
-    - meta: 会话元信息（时间/模式/源/目标等），写入首行便于追溯
-    - lines: 整理过程日志行（仅用于界面/终端输出，不再落盘）
-    - actions: 实际执行的动作清单（move/copy + src/dst）
-    - keep: 保留最近几份操作清单
-    """
-    d = get_logs_dir()
-    stem = "organize_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-    jsonl_path = d / (stem + ".jsonl")
-    n = 1
-    while jsonl_path.exists():  # 同秒重名时追加序号，避免覆盖
-        n += 1
-        jsonl_path = d / f"{stem}_{n}.jsonl"
-    stem = jsonl_path.stem
-    try:
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            meta_rec = {"type": "meta", "ok": False, "action_count": len(actions), **meta}
-            f.write(json.dumps(meta_rec, ensure_ascii=False) + "\n")
-            for rec in actions:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError as e:
-        # 写入失败不返回假路径：抛出原始异常，由上层统一报错，避免用户误以为清单已保存
-        raise OSError(f"{_t('err_save_log')}{e}") from e
-    # 清理旧操作清单：保留最近 keep 份
-    try:
-        keep = max(1, int(keep))
-        logs = sorted([p for p in d.iterdir() if p.suffix.lower() == ".jsonl"],
-                      key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in logs[keep:]:
-            old.unlink(missing_ok=True)
-    except OSError:
-        pass
-    return jsonl_path
-
-
-def _path_within(root: Path, p: Path) -> bool:
-    """路径范围校验（二审 SEC1）：p 必须位于 root 目录之下。
-
-    拒绝条件：路径含 '..' 段、解析失败、或解析结果为文件系统根。
-    """
-    try:
-        r = root.resolve()
-        q = p.resolve()
-    except OSError:
-        return False
-    if ".." in p.parts or ".." in q.parts:
-        return False
-    if q == q.anchor:  # 文件系统根
-        return False
-    try:
-        return q.is_relative_to(r)
-    except AttributeError:
-        return str(q).startswith(str(r) + os.sep)
-
-
-def restore_from_log(stem: str, log_func=print) -> dict:
-    """根据日志的操作清单（.jsonl）还原变更。
-
-    - 移动模式：把当时移动成功的文件从目标位置移回原路径；
-    - 复制模式：删除当时复制产生的副本（原文件本就在源位置）。
-    安全策略：仅当目标文件仍存在且原位置已空出时执行，避免覆盖现有文件。
-    返回统计: {"moved": n, "removed": n, "skipped": n, "missing": n, "error": msg?}
-    """
-    d = get_logs_dir()
-    jsonl_path = d / (stem + ".jsonl")
-    if not jsonl_path.exists():
-        return {"error": _t("err_no_actions")}
-    stats = {"moved": 0, "removed": 0, "skipped": 0, "missing": 0}
-    try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            # 首行为会话元信息：记录源/目标目录，作为还原路径范围校验基准（二审 SEC1）
-            src_root = dest_root = None
-            first = f.readline().strip()
-            if first:
-                try:
-                    meta_rec = json.loads(first)
-                except json.JSONDecodeError:
-                    meta_rec = {}
-                if meta_rec.get("type") == "meta":
-                    src_root = Path(meta_rec["src"]) if meta_rec.get("src") else None
-                    dest_root = Path(meta_rec["dest"]) if meta_rec.get("dest") else None
-            if src_root is None or dest_root is None:
-                return {"error": _t("err_restore_scope")}
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not rec.get("ok"):
-                    continue
-                typ = rec.get("type")
-                src = Path(rec["src"])
-                dst = Path(rec["dst"])
-                # 二审 SEC1：路径必须位于该次会话记录的源/目标目录之下，否则跳过并告警
-                if not (_path_within(src_root, src) and _path_within(dest_root, dst)):
-                    stats["skipped"] += 1
-                    log_func(f"{_t('warn_restore_skip_scope')}{src} -> {dst}")
-                    continue
-                if typ == "move":
-                    if not dst.exists():
-                        stats["missing"] += 1
-                        log_func(f"{_t('skip_dst_missing')}{dst}")
-                        continue
-                    if src.exists():
-                        stats["skipped"] += 1
-                        log_func(f"{_t('skip_src_exists')}{src}")
-                        continue
-                    try:
-                        src.parent.mkdir(parents=True, exist_ok=True)
-                        _safe_transfer(dst, src, copy_mode=False)
-                        stats["moved"] += 1
-                        log_func(f"{_t('restore_move_pre')}{dst} -> {src}")
-                    except Exception as e:
-                        stats["skipped"] += 1
-                        log_func(f"{_t('err_restore')}{dst} -> {src} ({e})")
-                elif typ == "copy":
-                    if dst.exists():
-                        try:
-                            dst.unlink()
-                            stats["removed"] += 1
-                            log_func(f"{_t('restore_rm_copy')}{dst}")
-                        except OSError as e:
-                            stats["skipped"] += 1
-                            log_func(f"{_t('err_rm_copy')}{dst} ({e})")
-                    else:
-                        stats["missing"] += 1
-                        log_func(f"{_t('skip_copy_missing')}{dst}")
-    except OSError as e:
-        return {"error": f"{_t('err_read_log')}{e}"}
-    return stats
-
-
-def _rollback_done_msg(stats: dict) -> str:
-    """还原完成汇总行（i18n 拼接，避免硬编码中文）。"""
-    return (f"{_t('rollback_done_pre')}{stats.get('moved', 0)}{_t('rollback_done_rm_sep')}{stats.get('removed', 0)}"
-            f"{_t('rollback_done_skip_sep')}{stats.get('skipped', 0)}{_t('rollback_done_missing_sep')}{stats.get('missing', 0)}")
-
-
+# ========== 核心逻辑导入（MCP 化第一阶段：核心逻辑已拆分至 core.py，纯逻辑无 GUI 依赖） ==========
+from core import (APP_NAME, DEFAULT_LOG_KEEP, _tag_pad, _clamp_log_keep,
+                  get_config_dir, ensure_config_dir, get_config_file,
+                  load_config, save_config, reset_config, clear_all_data,
+                  get_exif_dt, get_exif_date, get_name_dt, get_name_date,
+                  get_file_dt, get_file_dt_noexif, get_file_date,
+                  _sanitize_name, is_trashed_file, is_hidden_file,
+                  collect_files, _safe_transfer, _cleanup_parts,
+                  organize, get_logs_dir, list_logs, write_organize_log,
+                  restore_from_log, _stats_to_meta)
 # ========== 日志标签着色（GUI 与 CLI 共用） ==========
 _LOG_TAG = Literal["err", "warn", "skip", "sim", "move", "copy", "rename", "info", "hidden", "trash", "video"]
 
@@ -982,22 +148,6 @@ def _log_label_pairs() -> list:
     return [(a, b) for a, b in pairs if a]
 
 
-def _stats_to_meta(stats: dict) -> dict:
-    """把 organize 返回的 stats 转成可 JSON 序列化的精简统计（写入操作清单 meta 供后续查看摘要）。"""
-    return {
-        "moved": int(stats.get("moved", 0)),
-        "copied": int(stats.get("copied", 0)),
-        "skipped": int(stats.get("skipped", 0)),
-        "failed": int(stats.get("failed", 0)),
-        "new_dirs": len(stats.get("new_dirs") or ()),
-        "hidden": int(stats.get("hidden", 0)),
-        "trash": int(stats.get("trash", 0)),
-        "exif": int(stats.get("exif", 0)),
-        "fallback": int(stats.get("fallback", 0)),
-        "by_ext": stats.get("by_ext") or {},
-    }
-
-
 def format_log_summary(rec: dict) -> str:
     """从 meta 记录中生成处理结果摘要（多行文本，供 GUI / CLI --show-log 在明细末尾展示）。"""
     s = rec.get("stats")
@@ -1060,7 +210,6 @@ def format_log_line(rec: dict) -> str:
     if typ == "copy":
         return f"{_t('tag_copy')} {rec.get('src', '')} -> {rec.get('dst', '')}"
     return json.dumps(rec, ensure_ascii=False)
-
 
 # ========== 图形界面（--gui / -g 启动） ==========
 import queue
@@ -1704,6 +853,128 @@ def _t(key):
         return STRINGS["zh"][key]
     return key
 
+
+# ========== core 结构化消息翻译层（MCP 化：core 返回英文 code + 结构化参数，此处译为界面语言） ==========
+def _render_core_msg(item) -> str:
+    """把 core 的结构化消息 (code, params) 译为当前界面语言文本。
+
+    - 纯字符串（旧式调用/外部传入）原样透传；
+    - log_line 按 tag 前缀着色约定拼装标签（[跳过]/[模拟]/[移动]/[复制]/[重命名]等）；
+    - mode_header 按 dry/copy/move 映射模式文案；
+    - 其余按 STRINGS 键模板 + 结构化参数拼接，未知 code 返回原始结构。
+    """
+    if isinstance(item, str):
+        return item
+    code, params = item
+    if code == "log_line":
+        tags = "".join(_t("tag_" + t) for t in params.get("tags", []) if t)
+        tail_i18n = params.get("tail_i18n")
+        return (_tag_pad(tags) + params.get("name", "")
+                + (_t(tail_i18n) if tail_i18n else "")
+                + (params.get("tail") or ""))
+    if code == "mode_header":
+        mode = {"dry": _t("mode_dry"), "copy": _t("mode_copy_done"), "move": _t("mode_org_done")}.get(
+            params.get("mode", ""), params.get("mode", ""))
+        return f"\n===== {mode} ====="
+    if code == "summary":
+        return (f"{_t('sum_move')}{params['moved']}{_t('sum_copied_sep')}{params['copied']}"
+                f"{_t('sum_skipped_sep')}{params['skipped']}{_t('sum_failed_sep')}{params['failed']}{_t('unit_zhang')}")
+    if code == "summary_dirs":
+        return f"{_t('sum_new_dirs')}{params['n']}{_t('unit_ge')}"
+    if code == "summary_hidden_trash":
+        return f"{_t('sum_hidden_pre')}{params['hidden']}{_t('sum_trash_sep')}{params['trash']}{_t('unit_ge')}"
+    if code == "summary_exif":
+        return f"{_t('sum_exif')}{params['exif']}{_t('sum_fallback_sep')}{params['fallback']}{_t('unit_zhang')}"
+    if code == "detail_imgs":
+        return f"{_t('detail_imgs_pre')}{params['total']}{_t('detail_exif_sep')}{params['exif']}{_t('detail_fallback_sep')}{params['fallback']})"
+    if code == "detail_videos":
+        return f"{_t('detail_videos_pre')}{params['total']}{_t('detail_exif_sep')}{params['exif']}{_t('detail_fallback_sep')}{params['fallback']})"
+    if code == "detail_ext_line":
+        return f"  {params['ext']}: {params['total']}{_t('detail_exif_sep')}{params['exif']}{_t('detail_fallback_sep')}{params['fallback']})"
+    if code == "detail_skip":
+        return (f"{_t('detail_skip_pre')}{params['in_place']}{_t('detail_skip_dup_sep')}{params['dup']}"
+                f"{_t('detail_skip_nodate_sep')}{params['nodate']}{_t('detail_skip_hidden_sep')}{params['hidden']}"
+                f"{_t('detail_skip_trash_sep')}{params['trash']}{_t('unit_zhang')}")
+    if code == "no_files":
+        return _t("info_no_files") + (_t("incl_subfolders") if params.get("recursive") else "")
+    if code == "warn_pil":
+        return _t("warn_pil_pre") + (params.get("err") or _t("unknown_err")) + _t("warn_pil_post")
+    if code == "dest_created":
+        return f"{_t('log_dest_created')}{params['path']}"
+    if code == "src_missing":
+        return f"{_t('err_src_missing')}{params['path']}"
+    if code == "src_not_dir":
+        return f"{_t('err_src_not_dir')}{params['path']}"
+    if code == "dest_create_err":
+        return f"{_t('err_dest_create')}{params['path']} ({params['err']})"
+    if code == "dest_missing":
+        return f"{_t('err_dest_missing')}{params['path']}"
+    if code == "dest_not_dir":
+        return f"{_t('err_dest_not_dir')}{params['path']}"
+    if code == "bad_fmt":
+        return f"{_t('err_bad_fmt')}{params['err']}"
+    if code == "bad_group":
+        return f"{_t('err_bad_group')}{params['level']}"
+    if code == "fmt_time":
+        return f"{_t('err_fmt_time')}{params['label']} ({params['fmt']})"
+    if code == "warn_group_need":
+        return _t("warn_group_need")
+    if code == "skip_need_recursive":
+        return _t("tag_tip") + _t("info_skip_need_recursive")
+    if code == "skip_need_inplace":
+        return _t("tag_tip") + _t("info_skip_need_inplace")
+    if code == "detect_dirs":
+        return f"{_t('info_detect_pre')}{params['n']}{_t('info_skip_dirs_post')}"
+    if code == "warn_scan_dirs":
+        return f"{_t('warn_scan_dirs')}{params['err']}"
+    if code == "detail_title":
+        return _t("detail_title")
+    if code == "detail_by_ext":
+        return _t("detail_by_ext")
+    if code == "warn_restore_skip_scope":
+        return f"{_t('warn_restore_skip_scope')}{params['src']} -> {params['dst']}"
+    if code == "skip_dst_missing":
+        return f"{_t('skip_dst_missing')}{params['dst']}"
+    if code == "skip_src_exists":
+        return f"{_t('skip_src_exists')}{params['src']}"
+    if code == "restore_move_pre":
+        return f"{_t('restore_move_pre')}{params['dst']} -> {params['src']}"
+    if code == "err_restore":
+        return f"{_t('err_restore')}{params['dst']} -> {params['src']} ({params['err']})"
+    if code == "restore_rm_copy":
+        return f"{_t('restore_rm_copy')}{params['dst']}"
+    if code == "err_rm_copy":
+        return f"{_t('err_rm_copy')}{params['dst']} ({params['err']})"
+    if code == "skip_copy_missing":
+        return f"{_t('skip_copy_missing')}{params['dst']}"
+    if code == "err_no_actions":
+        return _t("err_no_actions")
+    if code == "err_restore_scope":
+        return _t("err_restore_scope")
+    if code == "err_read_log":
+        return f"{_t('err_read_log')}{params['err']}"
+    return f"[{code}] {params}"
+
+
+
+def _rollback_done_msg(stats: dict) -> str:
+    """还原完成汇总行（i18n 拼接，避免硬编码中文）。"""
+    return (f"{_t('rollback_done_pre')}{stats.get('moved', 0)}{_t('rollback_done_rm_sep')}{stats.get('removed', 0)}"
+            f"{_t('rollback_done_skip_sep')}{stats.get('skipped', 0)}{_t('rollback_done_missing_sep')}{stats.get('missing', 0)}")
+
+
+
+
+# ========== 布局与数量常量（GUI 专属，二审 STYLE1：消除魔法数字） ==========
+FMT_DIALOG_GEOM = "440x400"
+FMT_DIALOG_MINSIZE = (400, 340)
+FMT_HELP_GEOM = "460x420"
+FMT_HELP_MINSIZE = (420, 360)
+HELP_GEOM = "560x500"
+HELP_MINSIZE = (480, 380)
+MAX_HISTORY = 10
+FMT_GRID_COLS = 3  # 格式弹窗扩展名网格列数
+
 # ============ 国际化结束 ============
 
 
@@ -1775,6 +1046,14 @@ class _ToolTip:
 
 
 class PhotoOrganizerApp:
+    # 窗口图标（内嵌 PNG base64，避免打包后路径失效）
+    _ICON_B64 = (
+        "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"
+    )
     def __init__(self, root: "tk.Tk"):
         self.root = root
         self.log_q = queue.Queue()
@@ -1788,6 +1067,17 @@ class PhotoOrganizerApp:
         """构建全部界面控件（语言切换后整体重建并恢复状态）。"""
         root = self.root
         self.root.title(f"{_t('win_title')} v{__version__}")
+        self._set_window_icon()
+    def _set_window_icon(self):
+        """设置窗口图标（内嵌 base64，兼容打包后运行）"""
+        try:
+            import base64 as _b64
+            from tkinter import PhotoImage
+            _img = PhotoImage(data=_b64.b64decode(self._ICON_B64))
+            self.root.iconphoto(True, _img)
+        except Exception:
+            pass
+
         self.root.geometry("680x600")
         self.root.minsize(560, 460)
 
@@ -2181,13 +1471,13 @@ class PhotoOrganizerApp:
                 parent=self.root):
             return
         self._run_bg(
-            lambda logf: restore_from_log(stem, log_func=logf),
+            lambda logf: restore_from_log(stem, log_func=lambda item: logf(_render_core_msg(item))),
             on_done=self._on_restore_done,
             log_start=f"{_t('log_rollback_start')}{stem}")
 
     def _on_restore_done(self, stats):
         if "error" in stats:
-            messagebox.showerror(_t("title_error"), stats["error"], parent=self.root)
+            messagebox.showerror(_t("title_error"), _render_core_msg(stats["error"]), parent=self.root)
             return
         self.log(_rollback_done_msg(stats))
         self.root.bell()
@@ -2852,12 +2142,10 @@ class PhotoOrganizerApp:
     def worker(self, source_dir: str, dest_dir: str, fmt: str,
                group: str | None, year_fmt: str, month_fmt: str, day_fmt: str,
                dry_run: bool, snap: dict):
-        lines: list = []
         actions: list = []
 
-        def _log(msg: str):
-            self.log_q.put(msg)
-            lines.append(msg)
+        def _log(item):
+            self.log_q.put(_render_core_msg(item))
 
         try:
             stats = organize(source_dir, dest_dir, dry_run=dry_run,
@@ -2891,7 +2179,7 @@ class PhotoOrganizerApp:
                 if stats:
                     meta["stats"] = _stats_to_meta(stats)
                 try:
-                    log_path = write_organize_log(meta, lines, actions, keep)
+                    log_path = write_organize_log(meta, [], actions, keep)
                     self.log_q.put(f"{_t('log_saved')}{log_path.name}")
                 except Exception as e:
                     self.log_q.put(f"{_t('err_save_log')}{e}")
@@ -3049,9 +2337,9 @@ def main():
         return
     if args.rollback:
         stem = args.rollback[:-6] if args.rollback.endswith(".jsonl") else args.rollback
-        stats = restore_from_log(stem, log_func=print)
+        stats = restore_from_log(stem, log_func=lambda item: print(_render_core_msg(item)))
         if "error" in stats:
-            print(stats["error"])
+            print(_render_core_msg(stats["error"]))
             return
         print(_rollback_done_msg(stats))
         return
@@ -3122,12 +2410,10 @@ def main():
         PhotoOrganizerApp(root)
         root.mainloop()
     else:
-        lines: list = []
         actions: list = []
 
-        def _log(msg: str):
-            print(msg)
-            lines.append(msg)
+        def _log(item):
+            print(_render_core_msg(item))
 
         stats = organize(args.source_dir or SOURCE_DIR, args.dest_dir or DEST_DIR,
                  dry_run=args.dry_run, copy_mode=args.copy,
@@ -3165,7 +2451,7 @@ def main():
             if stats:
                 meta["stats"] = _stats_to_meta(stats)
             try:
-                log_path = write_organize_log(meta, lines, actions, keep)
+                log_path = write_organize_log(meta, [], actions, keep)
                 print(f"{_t('log_saved')}{log_path.name}")
             except Exception as e:
                 print(f"{_t('err_save_log')}{e}")

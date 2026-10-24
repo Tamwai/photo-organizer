@@ -1,0 +1,66 @@
+name: Publish MCP Server (PyPI + Registry)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build
+
+      - name: Verify version consistency
+        shell: bash
+        run: |
+          PYPROJ_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+          SERVER_VER=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' mcp_server.py | head -1)
+          echo "pyproject=$PYPROJ_VER mcp_server=$SERVER_VER tag=${GITHUB_REF_NAME}"
+          if [ "$PYPROJ_VER" != "$SERVER_VER" ]; then
+            echo "::error::version mismatch between pyproject.toml and mcp_server.py"
+            exit 1
+          fi
+          # 评审 #12：git tag（vX.Y.Z）必须与包版本一致，防止发布版本与代码版本脱节
+          if [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            TAG_VER="${GITHUB_REF_NAME#v}"
+            if [ "$PYPROJ_VER" != "$TAG_VER" ]; then
+              echo "::error::git tag ${GITHUB_REF_NAME} does not match package version ${PYPROJ_VER}"
+              exit 1
+            fi
+          fi
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Publish package to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        if: startsWith(github.ref, 'refs/tags/')
+        # 若组织未启用 Trusted Publishing，可改用 secrets.PYPI_API_TOKEN：
+        # with:
+        #   password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Create GitHub Release (for MCP Registry)
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # MCP Registry（registry.modelcontextprotocol.io）通过 GitHub App 集成收录：
+          # 1) 在本仓库安装官方 "MCP Registry" GitHub App 并授权；
+          # 2) 仓库根 server.json 提供元数据与 entrypoints；
+          # 3) 打 tag 发 Release 后 Registry 自动同步本 server 的发布版本。

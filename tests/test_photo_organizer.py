@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import core
 import photo_organizer as po
 
 
@@ -115,15 +116,15 @@ class TestRestoreFromLog(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="po_test_"))
         self.log_dir = self.tmp / "logs"
         self.log_dir.mkdir()
-        self.orig_get_logs_dir = po.get_logs_dir
-        po.get_logs_dir = lambda: self.log_dir
+        self.orig_get_logs_dir = core.get_logs_dir
+        core.get_logs_dir = lambda: self.log_dir
         self.src_dir = self.tmp / "src"
         self.dst_dir = self.tmp / "dst"
         self.src_dir.mkdir()
         self.dst_dir.mkdir()
 
     def tearDown(self):
-        po.get_logs_dir = self.orig_get_logs_dir
+        core.get_logs_dir = self.orig_get_logs_dir
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _write_log(self, stem, recs):
@@ -207,11 +208,11 @@ class TestWriteOrganizeLog(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="po_test_"))
         self.log_dir = self.tmp / "logs"
         self.log_dir.mkdir()
-        self.orig_get_logs_dir = po.get_logs_dir
-        po.get_logs_dir = lambda: self.log_dir
+        self.orig_get_logs_dir = core.get_logs_dir
+        core.get_logs_dir = lambda: self.log_dir
 
     def tearDown(self):
-        po.get_logs_dir = self.orig_get_logs_dir
+        core.get_logs_dir = self.orig_get_logs_dir
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_write_ok(self):
@@ -232,7 +233,7 @@ class TestWriteOrganizeLog(unittest.TestCase):
         # 使写入路径不可写（目录变文件），验证抛 OSError 而非返回假路径
         blocker = self.log_dir / "blocked"
         blocker.write_text("x")
-        po.get_logs_dir = lambda: blocker
+        core.get_logs_dir = lambda: blocker
         with self.assertRaises(OSError):
             po.write_organize_log(meta={}, lines=[], actions=[], keep=5)
 

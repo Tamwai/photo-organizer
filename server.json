@@ -1,0 +1,112 @@
+{
+  "$schema": "https://registry.modelcontextprotocol.io/schema/2025-06-18/server.json",
+  "namespace": "io.github.tamwai",
+  "name": "photo-organizer",
+  "version": "0.3.0",
+  "description": "MCP server that organizes photos and videos by date with a safe preview + confirm workflow, whitelist-based access control, and revert support.",
+  "publisher": "Tamwai",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tamwai/photo-organizer.git"
+  },
+  "documentation": "https://github.com/tamwai/photo-organizer#mcp",
+  "homepage": "https://github.com/tamwai/photo-organizer",
+  "tags": ["photo", "filesystem", "organizer", "media", "productivity"],
+  "tools": [
+    {
+      "name": "preview_organize",
+      "description": "预览整理计划（只读）：扫描源目录，计算每个文件的归类目标，返回 plan 与 confirm_token。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "source": { "type": "string", "description": "源文件夹绝对路径（必须位于白名单内）" },
+          "dest": { "type": "string", "description": "目标文件夹绝对路径（必须已存在，禁止自动创建）" },
+          "recursive": { "type": "boolean", "description": "是否递归扫描子文件夹", "default": false },
+          "include_video": { "type": "boolean", "description": "是否同时整理视频", "default": true },
+          "group": { "type": "string", "enum": ["flat", "year", "year-month", "year-month-day"], "description": "分组方式", "default": "flat" },
+          "date_format": { "type": "string", "description": "flat 模式下日期文件夹名格式（strftime）", "default": "%Y-%m-%d" },
+          "on_conflict": { "type": "string", "enum": ["skip", "rename"], "description": "重名冲突处理", "default": "skip" },
+          "photo_exts": { "type": "array", "items": { "type": "string" }, "description": "自定义图片扩展名列表", "default": null }
+        },
+        "required": ["source", "dest"]
+      }
+    },
+    {
+      "name": "organize_photos",
+      "description": "执行（或模拟）整理。默认 dry_run=True 只计算不移动；dry_run=False 必须传入与当前 plan 匹配的 confirm_token。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "source": { "type": "string" },
+          "dest": { "type": "string" },
+          "recursive": { "type": "boolean", "default": false },
+          "include_video": { "type": "boolean", "default": true },
+          "group": { "type": "string", "enum": ["flat", "year", "year-month", "year-month-day"], "default": "flat" },
+          "date_format": { "type": "string", "default": "%Y-%m-%d" },
+          "on_conflict": { "type": "string", "enum": ["skip", "rename"], "default": "skip" },
+          "photo_exts": { "type": "array", "items": { "type": "string" }, "default": null },
+          "dry_run": { "type": "boolean", "description": "True 仅预览统计；False 实际移动/复制", "default": true },
+          "copy": { "type": "boolean", "description": "复制模式（原文件保留）", "default": false },
+          "confirm_token": { "type": "string", "description": "来自 preview_organize 的 token；dry_run=False 时必填且必须匹配", "default": null }
+        },
+        "required": ["source", "dest"]
+      }
+    },
+    {
+      "name": "list_logs",
+      "description": "列出最近的操作清单（.jsonl），按修改时间倒序。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": { "type": "integer", "description": "最多返回条数", "default": 10 }
+        }
+      }
+    },
+    {
+      "name": "show_log",
+      "description": "查看指定操作清单明细。name 为日志名（stem，可带 .jsonl）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "日志名（stem，可带 .jsonl）" }
+        },
+        "required": ["name"]
+      }
+    },
+    {
+      "name": "revert_changes",
+      "description": "按操作清单还原一次整理。默认 dry_run=True 仅预览统计；False 实际还原（不覆盖已有文件）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "日志名（stem，可带 .jsonl）" },
+          "dry_run": { "type": "boolean", "description": "True 预览；False 执行还原", "default": true }
+        },
+        "required": ["name"]
+      }
+    },
+    {
+      "name": "get_config",
+      "description": "返回当前生效的 MCP 安全配置：白名单根目录、单次最大文件数、server 版本。",
+      "inputSchema": { "type": "object", "properties": {} }
+    }
+  ],
+  "security": {
+    "filesystem_controls": {
+      "description": "所有 source/dest 路径必须位于白名单根目录之下（启动参数 --allow > mcp_config.json > 默认 ~/Pictures；白名单为运行时配置，见 README「MCP 接入」）；系统目录禁区（Windows: C:\\Windows 等；POSIX: /etc 等）一律拒绝；dest 必须已存在，禁止自动创建目录；MCP 模式不支持原地整理（source 与 dest 相同或其子目录时返回 DEST_IN_SOURCE，原地整理请使用 CLI/GUI）。",
+      "no_network_access": true,
+      "destructive_actions": {
+        "moves_deletes": "organize_photos 与 revert_changes 默认 dry_run=True，实际执行必须传入与当前 plan 匹配的 confirm_token（SHA256），防止预览与执行不一致。",
+        "backup": "组织前可通过 copy=True 复制模式保留原文件；还原基于 .jsonl 操作清单，不覆盖已有文件。"
+      }
+    }
+  },
+  "entrypoints": {
+    "python": {
+      "module": "mcp_server",
+      "command": ["photo-organizer-mcp"],
+      "install": "pip install photo-organizer-mcp"
+    }
+  }
+}

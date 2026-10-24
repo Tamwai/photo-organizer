@@ -1,5 +1,18 @@
 # 更新记录
 
+## [0.3.0] - 2026-10-22
+
+新增 MCP（Model Context Protocol）服务器，使照片整理能力可通过标准协议接入 AI 客户端；同时将整理核心逻辑拆分为独立模块，既有 CLI/GUI 行为保持不变。
+
+### 新增
+
+- **core 逻辑层拆分**：整理核心逻辑（扫描、日期判定、传输、操作清单读写、还原）拆分为独立的纯逻辑模块，命令行与图形界面行为保持不变
+- **MCP 服务器**：提供 6 个工具——`preview_organize`（预览整理计划）、`organize_photos`（执行整理，默认模拟运行）、`list_logs`（列出操作清单）、`show_log`（查看明细）、`revert_changes`（还原变更）、`get_config`（查询安全配置）
+- **目录白名单**：源/目标路径必须位于白名单根目录之下；启动参数 `--allow` 优先，其次配置文件，默认 `~/Pictures`；配置文件按修改时间热加载
+- **确认令牌（confirm_token）**：预览生成计划摘要令牌，实际执行必须传入匹配令牌，防止预览与执行不一致
+- **固定错误码**：统一返回 `SRC_MISSING` / `PATH_NOT_ALLOWED` / `DEST_MISSING` / `DEST_IN_SOURCE` / `CONFIRM_TOKEN_MISMATCH` / `MAX_FILES_EXCEEDED` / `IO_ERROR`
+- **发布链路**：新增打包配置（`pyproject.toml`）、MCP Registry 元数据（`server.json`）与发布工作流（打 tag 自动构建并发布）
+
 ## [0.2.1] - 2026-10-21
 
 基于 v0.2.0 的改进，核心为日期解析准确性与安全性加固，并优化大批量整理性能。

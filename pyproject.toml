@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photo-organizer-mcp"
+version = "0.3.0"
+description = "MCP (Model Context Protocol) server for photo-organizer: organize photos/videos by date with a safe preview+confirm workflow."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Tamwai" }]
+keywords = ["mcp", "photo", "organizer", "filesystem", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: System :: Filesystems",
+]
+dependencies = [
+    "mcp>=1.2.0",
+    "pillow>=8.0",
+]
+
+[project.optional-dependencies]
+dev = ["pyinstaller>=6.0", "pytest>=7.0"]
+
+[project.scripts]
+photo-organizer-mcp = "mcp_server:main"
+
+[tool.setuptools]
+py-modules = ["mcp_server", "core"]

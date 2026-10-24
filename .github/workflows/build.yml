@@ -59,14 +59,28 @@ jobs:
         run: |
           awk '/^## \[/{c++} c==1{print} c==2{exit}' CHANGELOG.md > body.md
 
-      - name: Build executable
+      - name: Build executable (GUI windowed)
         shell: bash
         run: |
           VERSION=$(sed -n "s/.*__version__[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" photo_organizer.py | head -1)
+          ICON_OPTS=""
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then ICON_OPTS="--icon assets/icon.ico"; fi
           if [ -n "$UPX_DIR" ]; then
-            pyinstaller --onefile --upx-dir "$UPX_DIR" --name "photo-organizer-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
+            pyinstaller --onefile --noconsole --upx-dir "$UPX_DIR" $ICON_OPTS --name "photo-organizer-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
           else
-            pyinstaller --onefile --noupx --name "photo-organizer-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
+            pyinstaller --onefile --noconsole --noupx $ICON_OPTS --name "photo-organizer-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
+          fi
+
+      - name: Build executable (CLI)
+        shell: bash
+        run: |
+          VERSION=$(sed -n "s/.*__version__[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" photo_organizer.py | head -1)
+          ICON_OPTS=""
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then ICON_OPTS="--icon assets/icon.ico"; fi
+          if [ -n "$UPX_DIR" ]; then
+            pyinstaller --onefile --upx-dir "$UPX_DIR" $ICON_OPTS --name "photo-organizer-cli-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
+          else
+            pyinstaller --onefile --noupx $ICON_OPTS --name "photo-organizer-cli-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
           fi
 
       - name: Package source archive (Linux)
