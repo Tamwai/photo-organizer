@@ -25,7 +25,7 @@
 """
 import sys
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 import os
 import re
@@ -1068,15 +1068,6 @@ class PhotoOrganizerApp:
         root = self.root
         self.root.title(f"{_t('win_title')} v{__version__}")
         self._set_window_icon()
-    def _set_window_icon(self):
-        """设置窗口图标（内嵌 base64，兼容打包后运行）"""
-        try:
-            import base64 as _b64
-            from tkinter import PhotoImage
-            _img = PhotoImage(data=_b64.b64decode(self._ICON_B64))
-            self.root.iconphoto(True, _img)
-        except Exception:
-            pass
 
         self.root.geometry("680x600")
         self.root.minsize(560, 460)
@@ -1313,6 +1304,16 @@ class PhotoOrganizerApp:
 
         # 控件全部就绪后，加载持久化配置（缺失/损坏时按默认值）
         self._apply_config(load_config())
+
+    def _set_window_icon(self):
+        """设置窗口图标（内嵌 base64，兼容打包后运行）"""
+        try:
+            import base64 as _b64
+            from tkinter import PhotoImage
+            _img = PhotoImage(data=_b64.b64decode(self._ICON_B64))
+            self.root.iconphoto(True, _img)
+        except Exception:
+            pass
 
     def _refresh_skip_existing_state(self):
         """“跳过已有日期文件夹”仅在“包含子文件夹”勾选时可用，否则置灰。"""

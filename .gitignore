@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 mcp_config.json
+build/
+dist/
+*.spec

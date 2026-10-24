@@ -4,7 +4,7 @@
 
 ## 版本
 
-当前版本 **v0.3.0**。可用 `python photo_organizer.py --version` 查看。
+当前版本 **v0.3.1**。可用 `python photo_organizer.py --version` 查看。
 
 更新历史见 [CHANGELOG.md](CHANGELOG.md)。
 

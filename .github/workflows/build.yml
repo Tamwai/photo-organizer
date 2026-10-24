@@ -83,12 +83,6 @@ jobs:
             pyinstaller --onefile --noupx $ICON_OPTS --name "photo-organizer-cli-v${VERSION}-${{ matrix.asset_suffix }}" photo_organizer.py
           fi
 
-      - name: Package source archive (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          mkdir -p dist
-          git archive --format=zip --prefix="photo-organizer-src/" -o "dist/photo-organizer-src.zip" HEAD
-
       - name: Publish to Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')

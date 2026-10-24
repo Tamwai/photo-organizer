@@ -1,5 +1,14 @@
 # 更新记录
 
+## [0.3.1] - 2026-10-25
+
+修复 v0.3.0 打包版 GUI 启动即崩溃的问题（`NameError: name 'root' is not defined`）。根因是窗口图标设置方法被误插入界面构建方法体中间，导致后续界面构建代码作用域错乱。已将该方法移出并独立，GUI 正常启动；同时移除 Release 中重复的源码压缩包（GitHub 默认自带 Source code 归档）。
+
+### 修复
+
+- **GUI 启动崩溃**：修复 `_set_window_icon` 方法位置错误导致的启动报错，窗口图标设置与界面构建恢复正常
+- **Release 产物精简**：不再额外打包 `photo-organizer-src.zip`，避免与 GitHub 自动生成的源码归档重复
+
 ## [0.3.0] - 2026-10-22
 
 新增 MCP（Model Context Protocol）服务器，使照片整理能力可通过标准协议接入 AI 客户端；同时将整理核心逻辑拆分为独立模块，既有 CLI/GUI 行为保持不变。
