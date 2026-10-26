@@ -4,7 +4,7 @@
 
 ## 版本
 
-当前版本 **v0.3.1**。可用 `python photo_organizer.py --version` 查看。
+当前版本 **v0.3.2**。可用 `python photo_organizer.py --version` 查看。
 
 更新历史见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -178,6 +178,22 @@ pip install photo-organizer-mcp
 ```
 
 `--allow` 可多次传入，声明允许访问的根目录；未传时依次回退到配置文件（见下）与默认 `~/Pictures`。
+
+> **Windows 提示**：若客户端启动 `photo-organizer-mcp` 命令时报 `No module named 'mcp_server'`（部分客户端/进程管理器环境下 pip 生成的启动器找不到 Python site-packages），可改用 Python 解释器直接运行脚本：
+
+```json
+{
+  "mcpServers": {
+    "photo-organizer": {
+      "command": "C:/Python311/python.exe",
+      "args": ["C:/Python311/Lib/site-packages/mcp_server.py", "--allow", "D:/照片库"],
+      "type": "stdio"
+    }
+  }
+}
+```
+
+将示例中的路径替换为实际 Python 安装路径与 `site-packages` 下的 `mcp_server.py` 即可，功能完全一致。
 
 ### 工具
 

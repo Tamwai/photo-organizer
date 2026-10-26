@@ -421,6 +421,8 @@ _EN_TEMPLATES = {
     "detail_by_ext": "Detail by extension:",
     "detail_ext_line": "  {ext}: {total} (EXIF: {exif}, fallback: {fallback}))",
     "detail_skip": "Skipped by reason: in-place {in_place} | duplicate {dup} | no-date {nodate} | hidden {hidden} | trash {trash}",
+    "detail_skip_hidden_scanned": "hidden scanned: {hidden}",
+    "detail_skip_trash_scanned": "trash scanned: {trash}",
     "warn_restore_skip_scope": "[Warning] Skipped: outside recorded scope: {src} -> {dst}",
     "skip_dst_missing": "[Skip] Destination file missing: {dst}",
     "skip_src_exists": "[Skip] Original file already exists: {src}",
@@ -453,6 +455,14 @@ def _render_en(item) -> str:
                 + (params.get("tail") or ""))
     if code == "mode_header":
         return f"\n===== {_EN_MODES.get(params.get('mode', ''), params.get('mode', ''))} ====="
+    if code == "detail_skip":
+        if params.get("include_hidden_trash"):
+            return (f"Skipped by reason: in-place {params['in_place']} | duplicate {params['dup']} "
+                    f"| no-date {params['nodate']} | "
+                    + _EN_TEMPLATES["detail_skip_hidden_scanned"].format(hidden=params["hidden"])
+                    + " | "
+                    + _EN_TEMPLATES["detail_skip_trash_scanned"].format(trash=params["trash"]))
+        return _EN_TEMPLATES["detail_skip"].format(**params)
     tpl = _EN_TEMPLATES.get(code)
     if tpl is None:
         return f"[{code}] {params}"
@@ -834,7 +844,7 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
     if stats["skip_in_place"] or stats["skip_dup"] or stats["skip_nodate"] or stats["hidden"] or stats["trash"]:
         log_func(_emit("detail_skip", {"in_place": stats["skip_in_place"], "dup": stats["skip_dup"],
                                        "nodate": stats["skip_nodate"], "hidden": stats["hidden"],
-                                       "trash": stats["trash"]}))
+                                       "trash": stats["trash"], "include_hidden_trash": include_hidden_trash}))
     return stats
 
 

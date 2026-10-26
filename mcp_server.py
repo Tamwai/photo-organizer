@@ -51,7 +51,7 @@ from core import (
     write_organize_log,
 )
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 MAX_FILES_PER_RUN_DEFAULT = 5000
 
 # ---- 固定错误码 ----

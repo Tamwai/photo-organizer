@@ -25,7 +25,7 @@
 """
 import sys
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 import os
 import re
@@ -405,6 +405,8 @@ STRINGS = {
         "detail_skip_nodate_sep": " 张 | 无法识别日期 ",
         "detail_skip_hidden_sep": " 张 | 隐藏跳过 ",
         "detail_skip_trash_sep": " 张 | .trashed 跳过 ",
+        "detail_skip_hidden_scanned_sep": " 张 | 扫描到隐藏文件 ",
+        "detail_skip_trash_scanned_sep": " 张 | 扫描到 .trashed 文件 ",
         "err_read_sel": "[错误] 无法读取操作清单 ",
         "sel_log_pre": "已选择操作清单 ",
         "sel_log_post": " 条动作）",
@@ -700,6 +702,8 @@ STRINGS = {
         "detail_skip_nodate_sep": " | cannot identify date ",
         "detail_skip_hidden_sep": " | hidden skipped ",
         "detail_skip_trash_sep": " | .trashed skipped ",
+        "detail_skip_hidden_scanned_sep": " | hidden scanned: ",
+        "detail_skip_trash_scanned_sep": " | .trashed scanned: ",
         "err_read_sel": "[Error] Cannot read operation log ",
         "sel_log_pre": "Selected operation log ",
         "sel_log_post": " actions)",
@@ -892,6 +896,10 @@ def _render_core_msg(item) -> str:
     if code == "detail_ext_line":
         return f"  {params['ext']}: {params['total']}{_t('detail_exif_sep')}{params['exif']}{_t('detail_fallback_sep')}{params['fallback']})"
     if code == "detail_skip":
+        if params.get("include_hidden_trash"):
+            return (f"{_t('detail_skip_pre')}{params['in_place']}{_t('detail_skip_dup_sep')}{params['dup']}"
+                    f"{_t('detail_skip_nodate_sep')}{params['nodate']}{_t('detail_skip_hidden_scanned_sep')}{params['hidden']}"
+                    f"{_t('detail_skip_trash_scanned_sep')}{params['trash']}{_t('unit_zhang')}")
         return (f"{_t('detail_skip_pre')}{params['in_place']}{_t('detail_skip_dup_sep')}{params['dup']}"
                 f"{_t('detail_skip_nodate_sep')}{params['nodate']}{_t('detail_skip_hidden_sep')}{params['hidden']}"
                 f"{_t('detail_skip_trash_sep')}{params['trash']}{_t('unit_zhang')}")
