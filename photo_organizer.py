@@ -25,7 +25,7 @@
 """
 import sys
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 import os
 import re
@@ -162,6 +162,8 @@ def format_log_summary(rec: dict) -> str:
     if s.get("hidden") or s.get("trash"):
         out.append(f"{_t('tag_info')} {_t('sum_hidden_pre')}{s.get('hidden', 0)}"
                    f"{_t('sum_trash_sep')}{s.get('trash', 0)}{_t('unit_zhang')}")
+    if s.get("duplicates"):
+        out.append(f"{_t('tag_info')} {_t('sum_duplicates_pre')}{s.get('duplicates', 0)}{_t('unit_zhang')}")
     by_ext = s.get("by_ext")
     if isinstance(by_ext, dict) and by_ext:
         out.append(_t("detail_by_ext"))
@@ -239,6 +241,9 @@ STRINGS = {
         "chk_recursive": "包含子文件夹",
         "chk_skip_existing": "跳过已有日期文件夹",
         "chk_hidden_trash": "包含隐藏文件和.trashed 文件",
+        "chk_all_ext": "整理所有文件类型",
+        "lbl_exclude": "排除规则:",
+        "chk_delete_dup": "删除重复文件",
         "btn_formats": "图片格式…",
         "lbl_group": "文件夹分组:",
         "group_flat": "单层格式",
@@ -291,6 +296,9 @@ STRINGS = {
         "tip_skip_existing": "仅勾选“包含子文件夹”且源=目标（原地整理）时生效：源目录下已有的日期文件夹视为已整理，其中文件直接跳过，不判断文件日期（EXIF/文件名）",
         "tip_hidden_trash": "勾选后才会整理隐藏文件与 .trashed 文件。隐藏判定跨平台：Windows 隐藏属性或文件名以点开头；.trashed 为 Android 回收站文件（文件名以 .trashed- 开头），优先于隐藏判定、不叠加。默认不勾选，避免误整理回收站文件。",
         "tip_formats": "勾选要整理哪些图片格式，可自定义添加其他格式",
+        "tip_all_ext": "勾选后跳过扩展名白名单，任意类型文件（含非图片/视频，如文档、压缩包、临时文件）都会参与整理；建议配合「排除规则」挡掉不要的类型；图片格式勾选区将不可再点",
+        "tip_exclude": "按文件名/目录名正则排除文件，留空不启用。示例：^2025|\\.tmp$ 表示排除以 2025 开头或含 .tmp 的文件",
+        "tip_delete_dup": "目标目录已有相同内容的文件将被删除，不重复归档；模拟运行仅预览不删除",
         "tip_group": "目标文件夹的整理方式：单层日期文件夹，或按 年/月/日 嵌套",
         "tip_date_folder": "在 年/月/日 层级分组的最内层，再按日期格式创建文件夹",
         "tip_fmt_help": "日期格式（strftime）说明：%Y 年、%m 月、%d 日等记号与常用组合示例",
@@ -361,6 +369,7 @@ STRINGS = {
         "tag_trash": "[Trash]",
         "tag_video": "[视频]",
         "tag_delete": "[删除]",
+        "tag_dup": "[重复]",
         "err_src_missing": "[错误] 源文件夹不存在: ",
         "err_src_not_dir": "[错误] 源路径不是文件夹: ",
         "err_dest_missing": "[错误] 目标文件夹不存在: ",
@@ -392,6 +401,7 @@ STRINGS = {
         "unit_ge": " 个",
         "sum_hidden_pre": "扫描到隐藏文件 ",
         "sum_trash_sep": " 个 | .trashed 文件 ",
+        "sum_duplicates_pre": "删除重复: ",
         "sum_exif": "EXIF 判定: ",
         "sum_fallback_sep": " 张 | 兜底判定: ",
         "detail_title": "\n处理明细:",
@@ -407,6 +417,7 @@ STRINGS = {
         "detail_skip_trash_sep": " 张 | .trashed 跳过 ",
         "detail_skip_hidden_scanned_sep": " 张 | 扫描到隐藏文件 ",
         "detail_skip_trash_scanned_sep": " 张 | 扫描到 .trashed 文件 ",
+        "detail_skip_exclude_sep": " 张 | 正则排除 ",
         "err_read_sel": "[错误] 无法读取操作清单 ",
         "sel_log_pre": "已选择操作清单 ",
         "sel_log_post": " 条动作）",
@@ -477,7 +488,7 @@ STRINGS = {
         "log_fmt_help_pre": "以下为日期格式说明：",
         "log_help_body_pre": "以下为命令行用法说明：",
         "fmt_help_body": "【常用记号】（Python strftime 格式）\n%Y = 四位年份   → 2026\n%y = 两位年份   → 26\n%m = 两位月份   → 10\n%d = 两位日期   → 20\n%H = 小时(24h)  → 14\n%M = 分钟       → 30\n%S = 秒         → 05\n\n【常用组合示例】\n%Y         → 2026        （按年）\n%Y-%m      → 2026-10     （按月）\n%Y-%m-%d   → 2026-10-20  （按日）\n%Y年%m月%d日 → 2026年10月20日（中文）\n%Y/%m/%d   → 2026/10/20  （斜杠分隔）\n%Y.%m.%d   → 2026.10.20  （点号分隔）\n\n【小提示】\n连接符可以用 -  /  .  空格，也可以写中文。\n想按年就 %Y，按月 %Y-%m，按日 %Y-%m-%d。\n",
-        "help_body": "用法:\n  photo-organizer [源文件夹] [目标文件夹] [选项]\n\n不带参数运行 → 自动打开图形界面；带参数运行 → 命令行模式\n\n【位置参数】\n  source_dir    源文件夹（从中读取照片）\n  dest_dir      目标文件夹（不提供时使用配置区 DEST_DIR）\n\n【常用选项】\n  -g, --gui                     强制启动图形界面\n  --dry-run                     模拟运行，只预览归类结果，不移动文件\n  --copy                        复制模式，原文件保留（默认移动）\n  -r, --recursive               递归扫描源文件夹的所有子文件夹\n  --prefix                      重名冲突时自动加来源文件夹名前缀\n  --skip-existing-date-folders  仅原地整理时跳过已有日期文件夹（默认启用）\n  --no-skip-existing-date-folders  关闭“跳过已有日期文件夹”\n  --date-folder                 层级分组时最内层再建日期文件夹\n  --date-format 格式            单层日期文件夹格式，默认 %Y-%m-%d\n  --group 层级                  year / year-month / year-month-day\n  --year-format / --month-format / --day-format  各层文件夹名格式\n  --add-photo-ext .raw          额外增加图片扩展名（可多次）\n  --remove-photo-ext .gif       临时排除图片扩展名（可多次）\n  --no-exif                     跳过 EXIF 读取，直接按文件名/文件时间判定（大批量时更快）\n  --include-hidden-trash        整理隐藏文件与 .trashed 文件（默认不处理）\n  --save-log                    保存操作清单到 jsonl（默认不保存）\n  --cleanup-parts               手动清理目标目录下的 .photo-org-tmp 半成品（逐条输出删除）\n  --clear-logs / --clear-data   清空操作清单 / 清理数据，均需附带 --yes 确认\n  --version                     显示版本号\n",
+        "help_body": "用法:\n  photo-organizer [源文件夹] [目标文件夹] [选项]\n\n不带参数运行 → 自动打开图形界面；带参数运行 → 命令行模式\n\n【位置参数】\n  source_dir    源文件夹（从中读取照片）\n  dest_dir      目标文件夹（不提供时使用配置区 DEST_DIR）\n\n【常用选项】\n  -g, --gui                     强制启动图形界面\n  --dry-run                     模拟运行，只预览归类结果，不移动文件\n  --copy                        复制模式，原文件保留（默认移动）\n  -r, --recursive               递归扫描源文件夹的所有子文件夹\n  --prefix                      重名冲突时自动加来源文件夹名前缀\n  --skip-existing-date-folders  仅原地整理时跳过已有日期文件夹（默认启用）\n  --no-skip-existing-date-folders  关闭“跳过已有日期文件夹”\n  --date-folder                 层级分组时最内层再建日期文件夹\n  --date-format 格式            单层日期文件夹格式，默认 %Y-%m-%d\n  --group 层级                  year / year-month / year-month-day\n  --year-format / --month-format / --day-format  各层文件夹名格式\n  --add-photo-ext .raw          额外增加图片扩展名（可多次）\n  --remove-photo-ext .gif       临时排除图片扩展名（可多次）\n  --no-exif                     跳过 EXIF 读取，直接按文件名/文件时间判定（大批量时更快）\n  --include-hidden-trash        整理隐藏文件与 .trashed 文件（默认不处理）\n  --save-log                    保存操作清单到 jsonl（默认不保存）\n  --cleanup-parts               手动清理目标目录下的 .photo-org-tmp 半成品（逐条输出删除）\n  --clear-logs / --clear-data   清空操作清单 / 清理数据，均需附带 --yes 确认\n  --version                     显示版本号\n  --exclude 正则                按文件名/目录名正则排除，留空不启用，如 ^2025|\\.tmp$\n  --all-extensions              跳过扩展名白名单，整理所有文件类型\n  --delete-duplicates           目标目录已有相同内容的文件时删除源文件（模拟运行仅报告不删除）\n",
         "prog_desc": "照片按拍摄日期归类脚本（命令行 + 图形界面）",
         "arg_version": "显示版本号",
         "arg_src": "源文件夹（从中读取照片）；不提供且无其它参数时自动打开图形界面",
@@ -495,6 +506,9 @@ STRINGS = {
         "arg_day_fmt": "层级分组时日层文件夹名格式（strftime），默认 %%d",
         "arg_add_ext": "额外增加要整理的图片扩展名（可多次使用），如 --add-photo-ext .raw",
         "arg_remove_ext": "临时排除图片扩展名（可多次使用，仅在本次运行生效），如 --remove-photo-ext .gif",
+        "arg_exclude": "按文件名/目录名正则排除文件（re.search 匹配相对路径，命中即跳过），如 --exclude '^2025|\\.tmp$'",
+        "arg_all_ext": "跳过扩展名白名单过滤，整理所有文件类型（可与 --exclude 组合使用）",
+        "arg_delete_dup": "目标目录已有相同内容的文件时删除源文件（先比大小、后比哈希；--dry-run 仅报告不删除）",
         "arg_no_exif": "跳过 EXIF 读取，仅依据文件名与系统时间整理（速度更快）",
         "arg_yes": "直接确认高危操作（--clear-logs / --clear-data 必须附带）",
         "msg_need_yes": "该操作不可逆，请附带 --yes 明确确认后执行",
@@ -536,6 +550,9 @@ STRINGS = {
         "chk_recursive": "Include subfolders",
         "chk_skip_existing": "Skip existing date folders",
         "chk_hidden_trash": "Include hidden and .trashed files",
+        "chk_all_ext": "Organize all file types",
+        "lbl_exclude": "Exclude rule:",
+        "chk_delete_dup": "Delete duplicate files",
         "btn_formats": "Image formats...",
         "lbl_group": "Folder grouping:",
         "group_flat": "Flat format",
@@ -588,6 +605,9 @@ STRINGS = {
         "tip_skip_existing": "Only active when 'Include subfolders' is checked and source=target (in-place): existing date folders are treated as organized and skipped without checking file dates",
         "tip_hidden_trash": "Check to also organize hidden files and .trashed files. Hidden detection is cross-platform: Windows hidden attribute or a leading dot; .trashed files are Android recycle-bin files (names starting with '.trashed-'), which take priority over hidden and are not double-tagged. Unchecked by default to avoid mis-sorting recycle-bin files.",
         "tip_formats": "Choose which image formats to organize; custom formats can be added",
+        "tip_all_ext": "When checked, the extension whitelist is skipped and files of ANY type (non-image/video, e.g. documents, archives, temp files) will be organized; consider pairing with the Exclude rule to filter out unwanted types; the image format checkboxes become disabled",
+        "tip_exclude": "Exclude files by regex on relative path (name/dir), leave empty to disable. Example: ^2025|\\.tmp$ excludes names starting with 2025 or containing .tmp",
+        "tip_delete_dup": "Files with identical content already in the target folder will be deleted instead of archived again; dry run only previews, does not delete",
         "tip_group": "How to organize target: flat date folder, or nested by year/month/day",
         "tip_date_folder": "At the innermost level of year/month/day grouping, also create folders by date format",
         "tip_fmt_help": "strftime date format reference: %Y year, %m month, %d day, and common combinations",
@@ -658,6 +678,7 @@ STRINGS = {
         "tag_trash": "[Trash]",
         "tag_video": "[Video]",
         "tag_delete": "[Delete]",
+        "tag_dup": "[Duplicate]",
         "err_src_missing": "[Error] Source folder does not exist: ",
         "err_src_not_dir": "[Error] Source path is not a folder: ",
         "err_dest_missing": "[Error] Target folder does not exist: ",
@@ -689,6 +710,7 @@ STRINGS = {
         "unit_ge": "",
         "sum_hidden_pre": "Hidden files found: ",
         "sum_trash_sep": " | .trashed files: ",
+        "sum_duplicates_pre": "Deleted duplicates: ",
         "sum_exif": "EXIF: ",
         "sum_fallback_sep": " | Fallback: ",
         "detail_title": "\nDetails:",
@@ -704,6 +726,7 @@ STRINGS = {
         "detail_skip_trash_sep": " | .trashed skipped ",
         "detail_skip_hidden_scanned_sep": " | hidden scanned: ",
         "detail_skip_trash_scanned_sep": " | .trashed scanned: ",
+        "detail_skip_exclude_sep": " | excluded by regex ",
         "err_read_sel": "[Error] Cannot read operation log ",
         "sel_log_pre": "Selected operation log ",
         "sel_log_post": " actions)",
@@ -774,7 +797,7 @@ STRINGS = {
         "log_fmt_help_pre": "Date format reference:",
         "log_help_body_pre": "Command-line usage:",
         "fmt_help_body": "[Common markers] (Python strftime)\n%Y = 4-digit year  -> 2026\n%y = 2-digit year  -> 26\n%m = 2-digit month -> 10\n%d = 2-digit day   -> 20\n%H = hour (24h)    -> 14\n%M = minute        -> 30\n%S = second        -> 05\n\n[Common combinations]\n%Y        -> 2026        (by year)\n%Y-%m     -> 2026-10     (by month)\n%Y-%m-%d  -> 2026-10-20  (by day)\n%Y年%m月%d日 -> 2026年10月20日 (Chinese)\n%Y/%m/%d  -> 2026/10/20  (slash separated)\n%Y.%m.%d  -> 2026.10.20  (dot separated)\n\n[Tips]\nSeparators can be - / . space, or Chinese characters.\nBy year use %Y, by month %Y-%m, by day %Y-%m-%d.\n",
-        "help_body": "Usage:\n  photo-organizer [SOURCE] [DEST] [OPTIONS]\n\nRunning without arguments opens the GUI; with arguments runs CLI mode.\n\n[Positional arguments]\n  source_dir    Source folder (photos are read from here)\n  dest_dir      Target folder (uses DEST_DIR from config if omitted)\n\n[Common options]\n  -g, --gui                     Force launch GUI\n  --dry-run                     Dry run: only preview, do not move files\n  --copy                        Copy mode: originals kept (default is move)\n  -r, --recursive               Recursively scan all subfolders\n  --prefix                      Auto-add source folder name prefix on conflict\n  --skip-existing-date-folders  In-place only: skip existing date folders (enabled by default)\n  --no-skip-existing-date-folders  disable skip-existing (enabled by default)\n  --date-folder                 Also create date folders at innermost level\n  --date-format FMT             Flat date folder format, default %Y-%m-%d\n  --group LEVEL                 year / year-month / year-month-day\n  --year-format / --month-format / --day-format  per-level folder name format\n  --add-photo-ext .raw          Add an image extension (repeatable)\n  --remove-photo-ext .gif       Temporarily exclude an extension (repeatable)\n  --no-exif                     Skip EXIF, use filename/file time only (faster for large batches)\n  --include-hidden-trash        Organize hidden and .trashed files (default: skip)\n  --save-log                    Save operation log to jsonl (default: do not save)\n  --cleanup-parts               Manually clean .photo-org-tmp partials in target (one line per deletion)\n  --clear-logs / --clear-data   Clear logs / wipe data; both require --yes\n  --version                     Show version\n",
+        "help_body": "Usage:\n  photo-organizer [SOURCE] [DEST] [OPTIONS]\n\nRunning without arguments opens the GUI; with arguments runs CLI mode.\n\n[Positional arguments]\n  source_dir    Source folder (photos are read from here)\n  dest_dir      Target folder (uses DEST_DIR from config if omitted)\n\n[Common options]\n  -g, --gui                     Force launch GUI\n  --dry-run                     Dry run: only preview, do not move files\n  --copy                        Copy mode: originals kept (default is move)\n  -r, --recursive               Recursively scan all subfolders\n  --prefix                      Auto-add source folder name prefix on conflict\n  --skip-existing-date-folders  In-place only: skip existing date folders (enabled by default)\n  --no-skip-existing-date-folders  disable skip-existing (enabled by default)\n  --date-folder                 Also create date folders at innermost level\n  --date-format FMT             Flat date folder format, default %Y-%m-%d\n  --group LEVEL                 year / year-month / year-month-day\n  --year-format / --month-format / --day-format  per-level folder name format\n  --add-photo-ext .raw          Add an image extension (repeatable)\n  --remove-photo-ext .gif       Temporarily exclude an extension (repeatable)\n  --no-exif                     Skip EXIF, use filename/file time only (faster for large batches)\n  --include-hidden-trash        Organize hidden and .trashed files (default: skip)\n  --save-log                    Save operation log to jsonl (default: do not save)\n  --cleanup-parts               Manually clean .photo-org-tmp partials in target (one line per deletion)\n  --clear-logs / --clear-data   Clear logs / wipe data; both require --yes\n  --version                     Show version\n  --exclude REGEX               Exclude files by regex on relative path, empty to disable, e.g. ^2025|\\.tmp$\n  --all-extensions              Skip the extension whitelist; organize all file types\n  --delete-duplicates           Delete source files when target already has identical content (dry run only reports, no delete)\n",
         "prog_desc": "Photo organizer by capture date (CLI + GUI)",
         "arg_version": "show version",
         "arg_src": "source folder (photos are read from here); if omitted and no other arguments, opens GUI",
@@ -792,6 +815,9 @@ STRINGS = {
         "arg_day_fmt": "day-level folder name format (strftime), default %%d",
         "arg_add_ext": "add an image extension to organize (repeatable), e.g. --add-photo-ext .raw",
         "arg_remove_ext": "temporarily exclude an image extension (repeatable, current run only), e.g. --remove-photo-ext .gif",
+        "arg_exclude": "exclude files by regex on relative path (re.search; hit means skip), e.g. --exclude '^2025|\\.tmp$'",
+        "arg_all_ext": "skip the extension whitelist and organize all file types (can be combined with --exclude)",
+        "arg_delete_dup": "delete source files when the target folder already has identical content (size first, then hash; --dry-run only reports, does not delete)",
         "arg_no_exif": "skip EXIF reading; organize by filename and system time only (faster)",
         "arg_yes": "confirm high-risk operations explicitly (required for --clear-logs / --clear-data)",
         "msg_need_yes": "This operation is irreversible; append --yes to confirm",
@@ -889,6 +915,8 @@ def _render_core_msg(item) -> str:
         return f"{_t('sum_hidden_pre')}{params['hidden']}{_t('sum_trash_sep')}{params['trash']}{_t('unit_ge')}"
     if code == "summary_exif":
         return f"{_t('sum_exif')}{params['exif']}{_t('sum_fallback_sep')}{params['fallback']}{_t('unit_zhang')}"
+    if code == "summary_duplicates":
+        return f"{_t('sum_duplicates_pre')}{params['duplicates']}{_t('unit_zhang')}"
     if code == "detail_imgs":
         return f"{_t('detail_imgs_pre')}{params['total']}{_t('detail_exif_sep')}{params['exif']}{_t('detail_fallback_sep')}{params['fallback']})"
     if code == "detail_videos":
@@ -899,10 +927,12 @@ def _render_core_msg(item) -> str:
         if params.get("include_hidden_trash"):
             return (f"{_t('detail_skip_pre')}{params['in_place']}{_t('detail_skip_dup_sep')}{params['dup']}"
                     f"{_t('detail_skip_nodate_sep')}{params['nodate']}{_t('detail_skip_hidden_scanned_sep')}{params['hidden']}"
-                    f"{_t('detail_skip_trash_scanned_sep')}{params['trash']}{_t('unit_zhang')}")
+                    f"{_t('detail_skip_trash_scanned_sep')}{params['trash']}"
+                    f"{_t('detail_skip_exclude_sep')}{params.get('exclude', 0)}{_t('unit_zhang')}")
         return (f"{_t('detail_skip_pre')}{params['in_place']}{_t('detail_skip_dup_sep')}{params['dup']}"
                 f"{_t('detail_skip_nodate_sep')}{params['nodate']}{_t('detail_skip_hidden_sep')}{params['hidden']}"
-                f"{_t('detail_skip_trash_sep')}{params['trash']}{_t('unit_zhang')}")
+                f"{_t('detail_skip_trash_sep')}{params['trash']}"
+                f"{_t('detail_skip_exclude_sep')}{params.get('exclude', 0)}{_t('unit_zhang')}")
     if code == "no_files":
         return _t("info_no_files") + (_t("incl_subfolders") if params.get("recursive") else "")
     if code == "warn_pil":
@@ -1158,6 +1188,25 @@ class PhotoOrganizerApp:
         self.fmt_btn.pack(side=tk.LEFT, padx=(16, 0))
         _ToolTip(self.fmt_btn, _t("tip_formats"))
 
+        # 选项行 3：整理所有文件类型 / 排除规则 / 删除重复文件（图片格式按钮下方）
+        opts3 = ttk.Frame(root, padding=(10, 0, 10, 4))
+        opts3.pack(fill=tk.X)
+        self.all_ext_var = tk.BooleanVar(value=False)
+        self.all_ext_check = ttk.Checkbutton(opts3, text=_t("chk_all_ext"), variable=self.all_ext_var,
+                                             command=self._on_all_ext_toggle)
+        self.all_ext_check.pack(side=tk.LEFT, padx=(0, 16))
+        _ToolTip(self.all_ext_check, _t("tip_all_ext"))
+        ttk.Label(opts3, text=_t("lbl_exclude")).pack(side=tk.LEFT)
+        self.exclude_var = tk.StringVar(value="")
+        self.exclude_entry = ttk.Entry(opts3, textvariable=self.exclude_var, width=20)
+        self.exclude_entry.pack(side=tk.LEFT, padx=(4, 16))
+        _ToolTip(self.exclude_entry, _t("tip_exclude"))
+        self.delete_dup_var = tk.BooleanVar(value=False)
+        self.delete_dup_check = ttk.Checkbutton(opts3, text=_t("chk_delete_dup"),
+                                                variable=self.delete_dup_var)
+        self.delete_dup_check.pack(side=tk.LEFT)
+        _ToolTip(self.delete_dup_check, _t("tip_delete_dup"))
+
         # 分组方式行
         self.fmt_row = ttk.Frame(root, padding=(10, 0, 10, 4))
         self.fmt_row.pack(fill=tk.X)
@@ -1329,6 +1378,13 @@ class PhotoOrganizerApp:
             self.skip_existing_check.configure(state=tk.NORMAL)
         else:
             self.skip_existing_check.configure(state=tk.DISABLED)
+
+    def _on_all_ext_toggle(self):
+        """勾选「整理所有文件类型」后，图片格式按钮置灰不可点；取消勾选恢复。"""
+        if self.all_ext_var.get():
+            self.fmt_btn.configure(state=tk.DISABLED)
+        else:
+            self.fmt_btn.configure(state=tk.NORMAL)
 
     # ---------- 日志保存/导出/导入/还原 ----------
     def _refresh_log_combo(self):
@@ -1682,6 +1738,9 @@ class PhotoOrganizerApp:
             "month_fmt": "%m",
             "day_fmt": "%d",
             "date_folder_in_group": False,
+            "all_extensions": False,
+            "exclude_regex": "",
+            "delete_duplicates": False,
             "save_log": False,
             "log_keep_count": 30,
         }
@@ -1714,6 +1773,9 @@ class PhotoOrganizerApp:
         self.month_var.set(str(cfg.get("month_fmt", "%m")))
         self.day_var.set(str(cfg.get("day_fmt", "%d")))
         self.date_folder_var.set(bool(cfg.get("date_folder_in_group", False)))
+        self.all_ext_var.set(bool(cfg.get("all_extensions", False)))
+        self.exclude_var.set(str(cfg.get("exclude_regex", "")))
+        self.delete_dup_var.set(bool(cfg.get("delete_duplicates", False)))
         self.save_log_var.set(bool(cfg.get("save_log", False)))
         try:
             keep = int(cfg.get("log_keep_count", DEFAULT_LOG_KEEP))
@@ -1747,6 +1809,9 @@ class PhotoOrganizerApp:
             "month_fmt": self.month_var.get(),
             "day_fmt": self.day_var.get(),
             "date_folder_in_group": self.date_folder_var.get(),
+            "all_extensions": self.all_ext_var.get(),
+            "exclude_regex": self.exclude_var.get().strip(),
+            "delete_duplicates": self.delete_dup_var.get(),
             "save_log": self.save_log_var.get(),
             "log_keep_count": int(self.log_keep_var.get() or DEFAULT_LOG_KEEP),
             "language": CURRENT_LANG,
@@ -2140,6 +2205,9 @@ class PhotoOrganizerApp:
             "log_keep": self.log_keep_var.get().strip(),
             "group": self.fmt_combo.get(),
             "photo_exts": set(self._photo_exts),
+            "all_extensions": self.all_ext_var.get(),
+            "exclude_regex": self.exclude_var.get().strip(),
+            "delete_duplicates": self.delete_dup_var.get(),
         }
 
         t = threading.Thread(target=self.worker,
@@ -2167,6 +2235,9 @@ class PhotoOrganizerApp:
                      skip_existing_date_folders=snap["skip_existing"],
                      include_hidden_trash=snap["include_hidden_trash"],
                      photo_exts=snap["photo_exts"],
+                     allow_all_extensions=snap["all_extensions"],
+                     exclude_regex=snap["exclude_regex"],
+                     delete_duplicates=snap["delete_duplicates"],
                      actions=actions)
             if snap["save_log"]:
                 try:
@@ -2286,6 +2357,12 @@ def main():
                         help=_t("arg_add_ext"))
     parser.add_argument("--remove-photo-ext", dest="remove_photo_exts", action="append", default=[],
                         help=_t("arg_remove_ext"))
+    parser.add_argument("--exclude", dest="exclude_regex", default=None,
+                        help=_t("arg_exclude"))
+    parser.add_argument("--all-extensions", dest="all_extensions", action="store_true", default=False,
+                        help=_t("arg_all_ext"))
+    parser.add_argument("--delete-duplicates", dest="delete_duplicates", action="store_true", default=False,
+                        help=_t("arg_delete_dup"))
     parser.add_argument("--no-exif", dest="no_exif", action="store_true",
                         help=_t("arg_no_exif"))
     parser.add_argument("--yes", dest="yes", action="store_true",
@@ -2437,6 +2514,9 @@ def main():
                  add_photo_exts=args.add_photo_exts,
                  remove_photo_exts=args.remove_photo_exts,
                  no_exif=args.no_exif,
+                 exclude_regex=args.exclude_regex,
+                 allow_all_extensions=args.all_extensions,
+                 delete_duplicates=args.delete_duplicates,
                  log_func=_log, actions=actions)
 
         save_log = args.save_log  # CLI 默认不保存操作清单（BooleanOptionalAction 支持 --no-save-log 显式关闭）

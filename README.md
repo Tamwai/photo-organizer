@@ -1,10 +1,12 @@
 # Photo Organizer 照片按拍摄日期归类工具
 
+> ⚠️ 注意：本包为 `photo-organizer-mcp`，与 PyPI 上 Supporterino 维护的 `photo-organizer` / `photo_organizer` 无任何关联，请认准包名安装。
+
 将照片/视频按拍摄日期自动归类到日期文件夹的小工具。支持命令行（CLI）与图形界面（GUI），二者合并为单一脚本。
 
 ## 版本
 
-当前版本 **v0.3.2**。可用 `python photo_organizer.py --version` 查看。
+当前版本 **v0.4.0**。可用 `python photo_organizer.py --version` 查看。
 
 更新历史见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -115,6 +117,9 @@ python photo_organizer.py D:\照片源目录 --cleanup-parts
 | `--day-format FMT` | 层级分组时日层文件夹名格式（strftime） | `%d` |
 | `--add-photo-ext EXT` | 额外增加要整理的图片扩展名（可多次使用），如 `--add-photo-ext .raw` | — |
 | `--remove-photo-ext EXT` | 临时排除图片扩展名（可多次使用，仅本次运行生效），如 `--remove-photo-ext .gif` | — |
+| `--exclude REGEX` | 按正则排除文件：对源文件的相对路径执行 `re.search`，命中即跳过（与扩展名白名单叠加生效，先过类型白名单再按名字规则过滤），如 `--exclude "^2025\|\.tmp$"` | 不启用 |
+| `--all-extensions` | 跳过扩展名白名单过滤，所有文件类型均可整理（可配合 `--exclude` 全量精确整理） | 关闭 |
+| `--delete-duplicates` | 目标目录已存在内容一致文件时删除源文件，避免重复归档；判定先比大小、后比哈希（MD5，64KB 分块），大小不同直接放行；`--dry-run` 模拟运行仅报告不删除 | 关闭 |
 | `--no-video` | 不整理视频 | 同时整理图片与视频 |
 | `--include-hidden-trash` | 整理隐藏文件与 .trashed 文件（Android 回收站文件，文件名以 `.trashed-` 开头）；隐藏文件含 Windows 隐藏属性或文件名以点开头 | 不处理（默认跳过） |
 | `--no-exif` | 跳过 EXIF 读取，直接按文件名日期/文件时间判定（大批量整理时更快） | 读取 EXIF |

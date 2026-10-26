@@ -15,6 +15,7 @@ CLI / GUI / 后续 mcp_server.py 统一从此模块导入。
 """
 import os
 import re
+import hashlib
 import shutil
 import json
 import sys
@@ -313,14 +314,29 @@ def _tag_pad(text: str, width: int = 12) -> str:
 
 
 # ========== 文件收集与原子传输 ==========
-def collect_files(source: Path, dest_root: Path, supported: set, recursive: bool):
+def _md5_file(path: Path, block_size: int = 64 * 1024) -> str:
+    """分块计算文件 MD5（64KB 分块读取），用于内容重复判定（先比大小、后比哈希）。"""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(block_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def collect_files(source: Path, dest_root: Path, supported: set, recursive: bool,
+                  allow_all_extensions: bool = False):
     """收集源文件夹下待处理的照片/视频文件。
     - recursive: True 时递归扫描所有子文件夹，并排除目标文件夹（防止把目标扫进来）
+    - allow_all_extensions: True 时跳过扩展名白名单过滤，所有文件类型均可整理
     - 返回文件路径列表（递归时保留相对路径用于日志）
     """
     if not recursive:
         return [f for f in source.iterdir()
-                if f.is_file() and not f.is_symlink() and f.suffix.lower() in supported]
+                if f.is_file() and not f.is_symlink()
+                and (allow_all_extensions or f.suffix.lower() in supported)]
     files = []
     dest_resolved = dest_root.resolve()
     for root, dirs, names in os.walk(source):
@@ -329,7 +345,8 @@ def collect_files(source: Path, dest_root: Path, supported: set, recursive: bool
         dirs[:] = [d for d in dirs if (root_path / d).resolve() != dest_resolved]
         for name in names:
             p = root_path / name
-            if p.is_file() and not p.is_symlink() and p.suffix.lower() in supported:
+            if p.is_file() and not p.is_symlink() \
+                    and (allow_all_extensions or p.suffix.lower() in supported):
                 files.append(p)
     return files
 
@@ -390,10 +407,11 @@ def _cleanup_parts(dest_root: Path) -> list:
 _EN_MODES = {"dry": "DRY RUN", "copy": "COPY DONE", "move": "DONE"}
 _EN_TAGS = {"skip": "[Skip]", "sim": "[Sim]", "move": "[Move]", "copy": "[Copy]",
             "rename": "[Rename]", "error": "[Error]", "hidden": "[Hidden]",
-            "trash": "[Trash]", "video": "[Video]"}
+            "trash": "[Trash]", "video": "[Video]", "delete": "[Delete]"}
 _EN_TAILS = {"skip_in_place_post": " (inside an existing date folder)",
              "skip_no_date_post": " (no date)",
-             "skip_exists_post": " (already exists) "}
+             "skip_exists_post": " (already exists) ",
+             "skip_exclude_post": " (excluded by regex) "}
 _EN_TEMPLATES = {
     "src_missing": "Source folder does not exist: {path}",
     "src_not_dir": "Source is not a folder: {path}",
@@ -402,6 +420,7 @@ _EN_TEMPLATES = {
     "dest_missing": "Destination folder does not exist: {path}",
     "dest_not_dir": "Destination is not a folder: {path}",
     "bad_fmt": "Invalid date format: {err}",
+    "bad_regex": "Invalid exclude regex: {err}",
     "bad_group": "Invalid group level: {level}",
     "fmt_time": "Time directive not allowed in {label}: {fmt}",
     "warn_group_need": "[Info] Date folder inside group requires group levels to take effect; ignored",
@@ -412,6 +431,7 @@ _EN_TEMPLATES = {
     "detect_dirs": "[Info] Detected {n} existing date folder(s), files inside will be skipped",
     "warn_scan_dirs": "[Warning] Failed to scan date folders: {err}",
     "summary": "Moved: {moved} | Copied: {copied} | Skipped: {skipped} | Failed: {failed}",
+    "summary_duplicates": "Duplicates deleted: {duplicates}",
     "summary_dirs": "New date folders: {n}",
     "summary_hidden_trash": "Hidden: {hidden} | Trash: {trash}",
     "summary_exif": "EXIF: {exif} | Fallback: {fallback}",
@@ -456,13 +476,16 @@ def _render_en(item) -> str:
     if code == "mode_header":
         return f"\n===== {_EN_MODES.get(params.get('mode', ''), params.get('mode', ''))} ====="
     if code == "detail_skip":
+        base = _EN_TEMPLATES["detail_skip"].format(**params)
         if params.get("include_hidden_trash"):
-            return (f"Skipped by reason: in-place {params['in_place']} | duplicate {params['dup']} "
+            base = (f"Skipped by reason: in-place {params['in_place']} | duplicate {params['dup']} "
                     f"| no-date {params['nodate']} | "
                     + _EN_TEMPLATES["detail_skip_hidden_scanned"].format(hidden=params["hidden"])
                     + " | "
                     + _EN_TEMPLATES["detail_skip_trash_scanned"].format(trash=params["trash"]))
-        return _EN_TEMPLATES["detail_skip"].format(**params)
+        if params.get("exclude"):
+            base += f" | regex-excluded {params['exclude']}"
+        return base
     tpl = _EN_TEMPLATES.get(code)
     if tpl is None:
         return f"[{code}] {params}"
@@ -491,6 +514,9 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
              remove_photo_exts: set | list | None = None,
              no_exif: bool = False,
              include_hidden_trash: bool = False,
+             exclude_regex: str | None = None,
+             allow_all_extensions: bool = False,
+             delete_duplicates: bool = False,
              actions: list | None = None,
              pre_scanned: list | None = None):
     """整理源文件夹中的照片/视频到目标文件夹的日期子文件夹。
@@ -513,6 +539,13 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
     - remove_photo_exts: 临时排除的图片扩展名（CLI --remove-photo-ext）
     - no_exif: True 时跳过 EXIF 读取（文件名日期优先，其次文件时间），大量文件时更快（二审 PERF1）
     - include_hidden_trash: True 时也整理隐藏文件与 .trashed 文件（默认 False：跳过并打 [跳过][隐藏]/[跳过][Trash] 标签统计）
+    - exclude_regex: 正则表达式；对文件的源相对路径做 re.search，命中则跳过并计入跳过统计
+      （先过扩展名白名单，再按名字规则过滤；留空/None 不启用）
+    - allow_all_extensions: True 时跳过扩展名白名单过滤，所有文件类型均可整理
+    - delete_duplicates: True 时整理前递归扫描目标目录建立大小索引，源文件先比大小、
+      命中同大小才计算 MD5（64KB 分块）比对；内容一致判定为重复：实际执行删除源文件并写入
+      操作清单（动作类型 delete，记录源路径与对应目标路径），--dry-run 仅报告不删除；
+      命中重复时不再执行移动/复制（删除优先级最高）；统计新增 duplicates 计数
     - pre_scanned: 可选已扫描文件列表（Path 列表）；非 None 时跳过内部 collect_files，
       避免上层已扫描时二次扫描（评审 minor-5）。需保持与 collect_files 过滤语义一致。
     - actions: 可选列表；非模拟运行时，每次移动/复制成功追加
@@ -526,7 +559,8 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
     # 所有提前退出路径统一返回全 0 统计（键与正常路径一致），避免上层拿到 None（评审 #1）
     zero_stats = {"moved": 0, "copied": 0, "skipped": 0, "failed": 0, "new_dirs": set(), "exif": 0,
                   "fallback": 0, "skip_dup": 0, "skip_nodate": 0, "skip_in_place": 0,
-                  "hidden": 0, "trash": 0, "by_ext": {}, "skipped_files": []}
+                  "hidden": 0, "trash": 0, "skip_exclude": 0, "duplicates": 0,
+                  "by_ext": {}, "skipped_files": []}
     source = Path(source_dir)
     if not source.exists():
         log_func(_emit("src_missing", {"path": source_dir}))
@@ -586,7 +620,7 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
     exts |= {str(e).strip().lower() for e in (add_photo_exts or []) if str(e).strip()}
     exts -= {str(e).strip().lower() for e in (remove_photo_exts or []) if str(e).strip()}
     supported = exts | (set(VIDEO_EXTS) if include_video else set())
-    photos = pre_scanned if pre_scanned is not None else collect_files(source, dest_root, supported, recursive)
+    photos = pre_scanned if pre_scanned is not None else collect_files(source, dest_root, supported, recursive, allow_all_extensions)
 
     # Pillow 未加载时给出显式警告（EXIF 会静默失效，必须让用户看见）
     if not HAS_PIL:
@@ -599,7 +633,8 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
         return zero_stats
 
     stats = {"moved": 0, "copied": 0, "skipped": 0, "failed": 0, "new_dirs": set(), "exif": 0, "fallback": 0,
-             "skip_dup": 0, "skip_nodate": 0, "skip_in_place": 0, "hidden": 0, "trash": 0, "by_ext": {},
+             "skip_dup": 0, "skip_nodate": 0, "skip_in_place": 0, "hidden": 0, "trash": 0,
+             "skip_exclude": 0, "duplicates": 0, "by_ext": {},
              "skipped_files": []}
     seen_names: dict[str, set] = {}  # date_str -> 已占用文件名集合（dry-run 也能量重名）
 
@@ -662,6 +697,32 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
             except OSError as e:
                 log_func(_emit("warn_scan_dirs", {"err": str(e)}))
 
+    # 正则排除：编译一次，后续对每个文件的源相对路径做 re.search
+    exclude_re = None
+    if exclude_regex:
+        try:
+            exclude_re = re.compile(exclude_regex)
+        except re.error as e:
+            log_func(_emit("bad_regex", {"err": str(e)}))
+            return zero_stats
+
+    # 删除重复：整理前递归扫描目标目录建立"大小索引" {size -> [路径]}（不读内容）
+    dup_size_index: dict[int, list] = {}
+    if delete_duplicates:
+        try:
+            for _root, _dirs, _names in os.walk(dest_root):
+                _rp = Path(_root)
+                for _name in _names:
+                    _fp = _rp / _name
+                    if _fp.suffix.lower() == ".photo-org-tmp":
+                        continue  # 排除半成品临时文件
+                    try:
+                        dup_size_index.setdefault(_fp.stat().st_size, []).append(_fp)
+                    except OSError:
+                        pass
+        except OSError:
+            dup_size_index = {}
+
     for p in photos:
         try:
             # 已有日期文件夹内的文件视为已整理，不判断日期直接跳过
@@ -696,6 +757,70 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
                 else:
                     stats["hidden"] += 1
             extra_tag = (["hidden"] if is_hidden else []) + (["trash"] if is_trash else []) + (["video"] if is_video else [])
+            # 源相对路径：正则排除与删除重复分支共用（re.search 匹配与删除动作记录）
+            try:
+                rel_path = p.relative_to(source).as_posix()
+            except ValueError:
+                rel_path = p.name
+            # 正则排除：对源相对路径 re.search，命中则跳过并计入跳过统计（先过类型白名单，再按名字规则过滤）
+            if exclude_re is not None:
+                if exclude_re.search(rel_path):
+                    stats["skipped"] += 1
+                    stats["skip_exclude"] += 1
+                    stats["skipped_files"].append(str(p))
+                    log_func(_emit("log_line", {"tags": ["skip"], "name": rel_path,
+                                                "tail_i18n": "skip_exclude_post"}))
+                    continue
+
+            # 删除重复：源文件先比大小，命中同大小才计算 MD5 比对；内容一致判定为重复
+            # （dry-run 仅报告不删除；命中重复时不再执行移动/复制，删除优先级最高）
+            if delete_duplicates and dup_size_index:
+                try:
+                    p_size = p.stat().st_size
+                except OSError:
+                    p_size = None
+                if p_size is not None and p_size in dup_size_index:
+                    dup_target = None
+                    try:
+                        p_hash = _md5_file(p)
+                    except OSError:
+                        p_hash = None
+                    if p_hash is not None:
+                        for cand in dup_size_index[p_size]:
+                            try:
+                                if cand.resolve() == p.resolve():
+                                    continue
+                            except OSError:
+                                continue
+                            try:
+                                if _md5_file(cand) == p_hash:
+                                    dup_target = cand
+                                    break
+                            except OSError:
+                                continue
+                    if dup_target is not None:
+                        if dry_run:
+                            stats["duplicates"] += 1
+                            log_func(_emit("log_line", {"tags": ["sim", "delete"], "name": rel_path,
+                                                        "tail": f" -> {dup_target}"}))
+                            if actions is not None:
+                                actions.append({"type": "plan_delete", "src": str(p),
+                                                "dst": str(dup_target), "ok": True})
+                        else:
+                            try:
+                                p.unlink()
+                                stats["duplicates"] += 1
+                                log_func(_emit("log_line", {"tags": ["delete"], "name": rel_path,
+                                                            "tail": f" -> {dup_target}"}))
+                                if actions is not None:
+                                    actions.append({"type": "delete", "src": str(p),
+                                                    "dst": str(dup_target), "ok": True})
+                            except OSError as e:
+                                stats["failed"] += 1
+                                log_func(_emit("log_line", {"tags": ["error"], "name": rel_path,
+                                                            "tail": f" ({e})"}))
+                        continue
+
             ext = p.suffix.lower()
             ext_stat = stats["by_ext"].setdefault(ext, {"total": 0, "exif": 0, "fallback": 0})
             ext_stat["total"] += 1
@@ -841,10 +966,11 @@ def organize(source_dir: str, dest_dir: str, dry_run: bool = False,
         log_func(_emit("detail_ext_line", {"ext": ext, "total": c["total"],
                                            "exif": c["exif"], "fallback": c["fallback"]}))
     # 跳过原因细分
-    if stats["skip_in_place"] or stats["skip_dup"] or stats["skip_nodate"] or stats["hidden"] or stats["trash"]:
+    if stats["skip_in_place"] or stats["skip_dup"] or stats["skip_nodate"] or stats["hidden"] or stats["trash"] or stats["skip_exclude"]:
         log_func(_emit("detail_skip", {"in_place": stats["skip_in_place"], "dup": stats["skip_dup"],
                                        "nodate": stats["skip_nodate"], "hidden": stats["hidden"],
-                                       "trash": stats["trash"], "include_hidden_trash": include_hidden_trash}))
+                                       "trash": stats["trash"], "exclude": stats["skip_exclude"],
+                                       "include_hidden_trash": include_hidden_trash}))
     return stats
 
 
@@ -1023,6 +1149,8 @@ def _stats_to_meta(stats: dict) -> dict:
         "new_dirs": len(stats.get("new_dirs") or ()),
         "hidden": int(stats.get("hidden", 0)),
         "trash": int(stats.get("trash", 0)),
+        "skip_exclude": int(stats.get("skip_exclude", 0)),
+        "duplicates": int(stats.get("duplicates", 0)),
         "exif": int(stats.get("exif", 0)),
         "fallback": int(stats.get("fallback", 0)),
         "by_ext": stats.get("by_ext") or {},

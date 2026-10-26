@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "photo-organizer-mcp"
-version = "0.3.2"
-description = "MCP (Model Context Protocol) server for photo-organizer: organize photos/videos by date with a safe preview+confirm workflow."
+version = "0.4.0"
+description = "MCP (Model Context Protocol) server for photo-organizer: organize photos/videos by date with a safe preview+confirm workflow. Independent from the PyPI package \"photo-organizer\" by Supporterino."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
